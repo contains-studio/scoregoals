@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from ..config import Config
 from ..models import GoalAlignment, Report
 
@@ -17,6 +19,17 @@ def _make_backend(name: str, config: Config):
     return OllamaBackend(config)
 
 
+def _fallback_narrative(alignments: list[GoalAlignment]) -> str:
+    """Deterministic plain-text narrative for when no LLM is reachable."""
+    if not alignments:
+        return "No goals configured and no activity captured for the day."
+    bits = [f"{a.goal_name} {a.minutes:.0f}m ({a.pct_time:.0f}%)" for a in alignments]
+    return (
+        "Deterministic end-of-day summary (LLM narrative unavailable). "
+        "Time on goals: " + "; ".join(bits) + "."
+    )
+
+
 def generate(date: str, config: Config, backend_name: str) -> Report:
     """Produce the end-of-day Report for `date` using backend `backend_name`
     ("gemini" | "ollama").
@@ -24,6 +37,14 @@ def generate(date: str, config: Config, backend_name: str) -> Report:
     Flow: store.load_timeline (or aggregate.timeline.build), align.load_goals,
     align.align, construct the chosen backend, backend.analyze(kind="eod"),
     attach alignments, store.save_report + store.save_benchmark, return it.
+
+    The backend call is guarded: if the LLM is unreachable (nightly launchd
+    job, transient outage, missing gemini key) we emit a one-line warning and
+    fall back to a deterministic Report so the pipeline never crashes and the
+    report always renders. The alignment score + drift flags are always the
+    deterministic values from align.py (identical across backends, consistent
+    with the alignment table, empty day => 0); the LLM only contributes the
+    free-form narrative + suggestions.
     """
     from ..compare import align
     from ..store import load_timeline, save_benchmark, save_report
@@ -38,7 +59,23 @@ def generate(date: str, config: Config, backend_name: str) -> Report:
     alignments = align.align(timeline, goals)
 
     backend = _make_backend(backend_name, config)
-    report = backend.analyze(timeline, goals, "eod", alignments)
+    try:
+        report = backend.analyze(timeline, goals, "eod", alignments)
+    except Exception as exc:  # LLM unreachable — degrade to a deterministic report
+        print(
+            f"warning: eod backend '{backend.name}' unavailable ({exc}); "
+            "using deterministic summary",
+            file=sys.stderr,
+        )
+        report = Report(
+            date=timeline.date or date,
+            kind="eod",
+            backend=backend.name,
+            model=getattr(backend, "model", ""),
+            narrative=_fallback_narrative(alignments),
+            alignments=list(alignments),
+            raw={"error": str(exc), "error_type": exc.__class__.__name__},
+        )
 
     # Guarantee the identifying fields + the keyword alignment table are set,
     # regardless of what the backend chose to populate.
@@ -49,6 +86,15 @@ def generate(date: str, config: Config, backend_name: str) -> Report:
         report.backend = backend.name
     if not report.alignments:
         report.alignments = alignments
+
+    # Override the model's self-reported score/drift with the deterministic
+    # ones so the number is reproducible and identical across backends. Keep
+    # whatever the LLM said in raw for transparency.
+    report.raw = dict(report.raw or {})
+    report.raw["llm_overall_score"] = report.overall_score
+    report.raw["llm_drift_flags"] = list(report.drift_flags)
+    report.overall_score = align.overall_score(alignments)
+    report.drift_flags = align.drift_flags(timeline, goals, alignments)
 
     save_report(config, report)
     save_benchmark(config, report)

@@ -47,8 +47,19 @@ def run(
     (narrative notes the error, zero tokens/cost/latency/score) so the run is
     visible in the comparison, and never aborts the other backends. Each
     Report's alignments are filled from `alignments` if the backend did not.
+
+    The overall_score + drift_flags are overridden with the deterministic
+    values from align.py so the compare.csv `overall_score` column is the same
+    reproducible math for every backend (the comparison should differ only in
+    narrative/cost/latency, never in the underlying score). The LLM's
+    self-reported values are preserved in raw for transparency.
     Returns the Reports in backend order.
     """
+    from ..compare import align
+
+    det_score = align.overall_score(alignments)
+    det_flags = align.drift_flags(timeline, goals, alignments)
+
     reports: list[Report] = []
     for backend in backends:
         name = getattr(backend, "name", backend.__class__.__name__)
@@ -68,6 +79,11 @@ def run(
             )
         if not rpt.alignments:
             rpt.alignments = list(alignments)
+        rpt.raw = dict(rpt.raw or {})
+        rpt.raw["llm_overall_score"] = rpt.overall_score
+        rpt.raw["llm_drift_flags"] = list(rpt.drift_flags)
+        rpt.overall_score = det_score
+        rpt.drift_flags = list(det_flags)
         reports.append(rpt)
     return reports
 

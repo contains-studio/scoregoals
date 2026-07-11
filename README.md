@@ -44,7 +44,8 @@ Everything stays on-device except what you explicitly send to Gemini.
 cd /Users/contains/projects/dayloop
 python3 -m dayloop doctor                    # environment checklist
 python3 -m dayloop mock --date 2026-07-11    # deterministic test timeline
-python3 -m dayloop analyze 2026-07-11 --backend ollama   # once backends land
+python3 -m dayloop analyze 2026-07-11 --backend ollama   # local model + benchmark row
+python3 -m dayloop report  2026-07-11 --backend ollama   # -> data/reports/2026-07-11-eod.md
 ```
 
 All commands: `capture`, `analyze`, `report`, `plan`, `nudge`, `weekly`,

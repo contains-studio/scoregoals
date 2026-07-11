@@ -378,6 +378,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:  # defense-in-depth: never dump a raw traceback
+        print(f"dayloop: error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -7,10 +7,11 @@ Call priority inside analyze():
    candidates_token_count.
 2. The `gemini` CLI (OAuth via ~/.gemini) as a subprocess fallback — what
    works on Michael's machine today (GEMINI_API_KEY is NOT set). Invocation:
-   the shared prompt is piped on stdin to `gemini -m <model>` (per
-   `gemini --help`: "-p, --prompt ... Appended to input on stdin"; stdin
-   alone runs one-shot non-interactive). Override the argv tail with
-   `gemini_cli_args` in config.toml if the CLI's flags ever change.
+   `gemini -m <model> -p <prompt>` one-shot (per `gemini --help`: "use
+   -p/--prompt for non-interactive mode"). Bare stdin alone drops this build
+   of the CLI into its interactive/agentic harness (prose + tool chatter, no
+   JSON), so the prompt is passed via -p with stdin left empty. Override the
+   argv tail with `gemini_cli_args` in config.toml if the CLI's flags change.
    The CLI reports no usage, so tokens are base.estimate_tokens() estimates
    and raw["metered"] = false.
 3. Neither available -> RuntimeError with a clear message; benchmark.run
@@ -124,9 +125,16 @@ class GeminiBackend(AnalysisBackend):
         usage = getattr(resp, "usage_metadata", None)
         tin = getattr(usage, "prompt_token_count", None)
         tout = getattr(usage, "candidates_token_count", None)
+        thoughts = getattr(usage, "thoughts_token_count", None)
         metered = tin is not None and tout is not None
         tokens_in = int(tin) if tin else estimate_tokens(prompt)
-        tokens_out = int(tout) if tout else estimate_tokens(text)
+        # Reasoning models (e.g. gemini-2.5-flash) split generated tokens into
+        # the final answer (candidates) and the reasoning (thoughts); Google
+        # bills BOTH at the output rate, so cost must count both.
+        if tout is not None:
+            tokens_out = int(tout) + int(thoughts or 0)
+        else:
+            tokens_out = estimate_tokens(text)
 
         raw: dict = {
             "provider": "gemini-sdk",
@@ -134,14 +142,23 @@ class GeminiBackend(AnalysisBackend):
             "usage": {
                 "prompt_token_count": tin,
                 "candidates_token_count": tout,
-                "thoughts_token_count": getattr(usage, "thoughts_token_count", None),
+                "thoughts_token_count": thoughts,
+                "billed_output_tokens": tokens_out,
             },
             "metered": metered,
         }
         return text, tokens_in, tokens_out, metered, latency, raw
 
     def _call_cli(self, prompt: str) -> tuple[str, int, int, bool, float, dict]:
-        """OAuth path: pipe the prompt on stdin to `gemini -m <model>`."""
+        """OAuth path: run `gemini -m <model> -p <prompt>` one-shot.
+
+        The prompt goes through the CLI's non-interactive `-p/--prompt` flag
+        (per `gemini --help`: "use -p/--prompt for non-interactive mode"). The
+        earlier bare-stdin invocation dropped this build of the CLI into its
+        interactive/agentic harness, which returned conversational prose +
+        tool-error chatter instead of the requested JSON. Override the argv
+        tail with `gemini_cli_args` in config.toml if the flags ever change.
+        """
         exe = _find_gemini_cli()
         if exe is None:
             raise RuntimeError(
@@ -151,12 +168,19 @@ class GeminiBackend(AnalysisBackend):
             )
 
         extra = self.config.raw.get("gemini_cli_args")
+        # When the argv tail is overridden we keep piping the prompt on stdin
+        # (the override is expected to carry its own flags); the default path
+        # passes the prompt via -p and leaves stdin empty so the CLI stays
+        # one-shot instead of waiting for interactive input.
         if isinstance(extra, str) and extra.strip():
             args = shlex.split(extra)
+            stdin_input = prompt
         elif isinstance(extra, list) and extra:
             args = [str(a) for a in extra]
+            stdin_input = prompt
         else:
-            args = ["-m", self.model]
+            args = ["-m", self.model, "-p", prompt]
+            stdin_input = ""
         cmd = [exe, *args]
 
         env = dict(os.environ)
@@ -166,7 +190,7 @@ class GeminiBackend(AnalysisBackend):
         t0 = time.monotonic()
         try:
             proc = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True, timeout=timeout_s, env=env
+                cmd, input=stdin_input, capture_output=True, text=True, timeout=timeout_s, env=env
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"gemini CLI timed out after {timeout_s:.0f}s") from exc

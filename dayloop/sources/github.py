@@ -22,7 +22,7 @@ import json
 import shutil
 import subprocess
 import sys
-from datetime import date as _date, timedelta
+from datetime import date as _date, datetime, timedelta, timezone
 
 from ..config import Config
 from ..models import ActivityRecord
@@ -35,6 +35,27 @@ def _log(msg: str) -> None:
 def _next_day(date: str) -> str:
     y, m, d = (int(p) for p in date.split("-"))
     return (_date(y, m, d) + timedelta(days=1)).isoformat()
+
+
+def _local_date_of(iso_ts: str) -> str | None:
+    """Local calendar date (YYYY-MM-DD) of an ISO-8601 timestamp.
+
+    GitHub's `created_at` is UTC (e.g. '2026-07-11T19:15:03Z'); convert it to
+    local time before bucketing so it agrees with the local-time day window
+    the git sweep and aggregate.timeline use. Returns None if unparseable.
+    """
+    s = (iso_ts or "").strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:  # assume UTC when the timestamp carries no offset
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().date().isoformat()
 
 
 # --- (1) local git sweep -----------------------------------------------------
@@ -137,7 +158,7 @@ def _gh_events(date: str, user: str) -> list[ActivityRecord]:
         if not isinstance(ev, dict):
             continue
         created = str(ev.get("created_at") or "")
-        if not created.startswith(date):
+        if _local_date_of(created) != date:  # UTC created_at -> local day
             continue
         etype = str(ev.get("type") or "")
         repo = str((ev.get("repo") or {}).get("name") or "")
