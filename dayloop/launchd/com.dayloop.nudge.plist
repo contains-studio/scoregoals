@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dayloop.nudge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__DAYLOOP_BIN__</string>
+        <string>nudge</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DAYLOOP_REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__DAYLOOP_BINDIR__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Drift check every 20 minutes (1200s). Notifies only when drifting. -->
+    <key>StartInterval</key>
+    <integer>1200</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/dayloop/nudge.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/dayloop/nudge.err.log</string>
+</dict>
+</plist>

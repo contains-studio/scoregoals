@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dayloop.eod</string>
+
+    <!--
+      End-of-day capture + report at 21:00.
+      `capture`/`report` take a positional YYYY-MM-DD, so the date is computed at
+      run time via /bin/sh. The report runs only if capture succeeds (&&).
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>D="$(date +%Y-%m-%d)"; "__DAYLOOP_BIN__" capture "$D" &amp;&amp; "__DAYLOOP_BIN__" report "$D" --backend ollama</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__DAYLOOP_REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__DAYLOOP_BINDIR__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/dayloop/eod.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/dayloop/eod.err.log</string>
+</dict>
+</plist>

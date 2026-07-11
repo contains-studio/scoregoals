@@ -1,0 +1,20 @@
+# dayloop configuration — safe defaults; the app runs with this file untouched.
+# All keys optional; missing keys fall back to the same defaults in dayloop/config.py.
+# NEVER put GEMINI_API_KEY in this file — it is read from the environment only.
+
+data_dir = "./data"                       # relative paths resolve against this file's directory
+screenpipe_url = "http://localhost:3030"  # screenpipe local API (not installed yet -> doctor shows ✗, mock mode still works)
+ollama_url = "http://localhost:11434"
+ollama_model = "huihui_ai/qwen3-abliterated:4b-thinking-2507-fp16"  # the one model already pulled on this machine
+gemini_model = "gemini-2.5-flash"
+
+# Gemini pricing, USD per 1M tokens.
+# EDITABLE PLACEHOLDERS — verify against https://ai.google.dev/pricing before
+# trusting any cost numbers in benchmarks.
+gemini_price_in_per_1m = 0.30
+gemini_price_out_per_1m = 2.50
+
+projects_dir = "/Users/contains/projects" # scanned for local git activity + project inference
+github_user = "mgalpert"
+nudge_threshold_min = 20                  # minutes of off-goal drift before a nudge fires
+icloud_mirror = ""                        # e.g. "/Users/contains/Library/Mobile Documents/com~apple~CloudDocs/dayloop"; empty = off

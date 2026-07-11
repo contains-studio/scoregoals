@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dayloop"
+version = "0.1.0"
+description = "Personal, local-first cybernetic activity tracker for macOS (screenpipe -> timeline -> goals -> feedback)"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Michael Galpert", email = "mgalpert@gmail.com" }]
+dependencies = [
+    "requests",
+    "python-dateutil",
+]
+
+[project.optional-dependencies]
+# Only needed for the SDK path of the gemini backend (the OAuth CLI path
+# works without it). Import lazily — the core pipeline must run without this.
+gemini = ["google-genai"]
+# Only for the focused-window snapshot / EventKit calendar path. Lazy import.
+macos = ["pyobjc"]
+
+[project.scripts]
+dayloop = "dayloop.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dayloop"]
