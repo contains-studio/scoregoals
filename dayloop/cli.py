@@ -224,7 +224,8 @@ def cmd_today_show(args: argparse.Namespace) -> int:
         mark = "x" if it["done"] else " "
         goal = f"  → {it['goal_name']}" if it.get("goal_name") else "  (no goal)"
         attr = f"  [{it['attributed_minutes']:.0f}m today]" if it.get("attributed_minutes") else ""
-        print(f"  {i}. [{mark}] {it['text']}{goal}{attr}")
+        carried = f"  ↩ {it['carried_from']}" if it.get("carried_from") else ""
+        print(f"  {i}. [{mark}] {it['text']}{goal}{attr}{carried}")
         if it.get("apps"):
             print(f"        apps: {', '.join(it['apps'])}")
     return 0
@@ -277,13 +278,50 @@ def cmd_today_toggle(args: argparse.Namespace) -> int:
 
 
 def cmd_today_clear(args: argparse.Namespace) -> int:
-    """today clear: remove all of today's intentions."""
+    """today clear [--keep-history]: remove today's intentions only.
+
+    Clearing NEVER touches past days' files — history is the archive. The
+    `--keep-history` flag is the default (and only) behavior; it is accepted so
+    the guarantee is explicit and scriptable.
+    """
     cfg = _cfg(args)
     from . import intentions
 
     d = _today_date(args)
     intentions.clear(cfg, d)
-    print(f"cleared intentions for {d}")
+    print(f"cleared intentions for {d} (past days' history preserved)")
+    return 0
+
+
+def cmd_today_history(args: argparse.Namespace) -> int:
+    """today history [--days N] [--json]: past intentions + completion rate."""
+    cfg = _cfg(args)
+    from . import intentions
+
+    days = getattr(args, "days", None) or intentions.HISTORY_DAYS
+    end = _today_date(args)
+    hist = intentions.history(cfg, days=days, end_date=end)
+    if getattr(args, "json", False):
+        _print_json(hist)
+        return 0
+
+    print(f"dayloop — intentions history (last {hist['days']} days ending {hist['end_date']})")
+    for day in hist["days_list"]:
+        items = day["items"]
+        if not items:
+            print(f"  {day['date']}  —  (none)")
+            continue
+        print(f"  {day['date']}  ({day['n_done']}/{day['n_total']} done)")
+        for it in items:
+            mark = "x" if it["done"] else " "
+            carried = f" ↩ from {it['carried_from']}" if it.get("carried_from") else ""
+            attr = f"  [{it['attributed_minutes']:.0f}m]" if it.get("attributed_minutes") else ""
+            print(f"    [{mark}] {it['text']}{carried}{attr}")
+    rate = hist["completion_rate"] * 100
+    print(
+        f"  completion: {hist['items_done']}/{hist['items_total']} items done "
+        f"({rate:.0f}%) over {hist['days']} days"
+    )
     return 0
 
 
@@ -399,19 +437,26 @@ def cmd_config_set(args: argparse.Namespace) -> int:
 
 def _goals_payload(cfg: Config) -> dict:
     """Build the `goals --json` object: the file path, its verbatim text, and
-    the parsed goals (id/name/keywords/target_pct)."""
+    the parsed goals (id/name/keywords/target_pct/archived). Archived goals are
+    INCLUDED here (with archived:true) so the editor can list + unarchive them."""
     from .compare import align
 
     try:
         raw = Path(cfg.goals_path).read_text(encoding="utf-8")
     except OSError:
         raw = ""
-    goals = align.load_goals(cfg)
+    goals = align.load_goals(cfg, include_archived=True)
     return {
         "path": cfg.goals_path,
         "raw": raw,
         "goals": [
-            {"id": g.id, "name": g.name, "keywords": g.keywords, "target_pct": g.target_pct}
+            {
+                "id": g.id,
+                "name": g.name,
+                "keywords": g.keywords,
+                "target_pct": g.target_pct,
+                "archived": g.archived,
+            }
             for g in goals
         ],
     }
@@ -425,10 +470,38 @@ def _print_goals_summary(payload: dict) -> None:
         return
     for g in goals:
         tgt = f" (target {g['target_pct']:.0f}%)" if g.get("target_pct") is not None else ""
+        flag = " [archived]" if g.get("archived") else ""
         kws = ", ".join(g.get("keywords") or [])
-        print(f"  - {g['id']}: {g['name']}{tgt}")
+        print(f"  - {g['id']}: {g['name']}{tgt}{flag}")
         if kws:
             print(f"      keywords: {kws}")
+
+
+def _cmd_goals_set_archived(args: argparse.Namespace, archived: bool) -> int:
+    cfg = _cfg(args)
+    from .compare import align
+
+    ok = align.set_archived(cfg, args.goal_id, archived)
+    verb = "archived" if archived else "unarchived"
+    if not ok:
+        ids = ", ".join(g.id for g in align.load_goals(cfg, include_archived=True)) or "(none)"
+        print(
+            f"dayloop: no goal with id {args.goal_id!r}; known ids: {ids}",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"{verb} goal: {args.goal_id}")
+    return 0
+
+
+def cmd_goals_archive(args: argparse.Namespace) -> int:
+    """goals archive <goal-id>: retire a goal (excluded from alignment)."""
+    return _cmd_goals_set_archived(args, True)
+
+
+def cmd_goals_unarchive(args: argparse.Namespace) -> int:
+    """goals unarchive <goal-id>: reactivate an archived goal."""
+    return _cmd_goals_set_archived(args, False)
 
 
 def cmd_goals(args: argparse.Namespace) -> int:
@@ -712,8 +785,14 @@ def build_parser() -> argparse.ArgumentParser:
     q = today_sub.add_parser("toggle", help="flip done by intention id or 1-based index")
     q.add_argument("ref", help="intention id or 1-based index")
     q.set_defaults(func=cmd_today_toggle)
-    q = today_sub.add_parser("clear", help="remove all of today's intentions")
+    q = today_sub.add_parser("clear", help="remove today's intentions (past days' history is kept)")
+    q.add_argument("--keep-history", action="store_true",
+                   help="default+only behavior: never delete past days' files")
     q.set_defaults(func=cmd_today_clear)
+    q = today_sub.add_parser("history", help="show past intentions + completion rate (default 7 days)")
+    q.add_argument("--days", type=int, metavar="N", help=f"days to include (default {7})")
+    q.add_argument("--json", action="store_true", help="print the history block as JSON")
+    q.set_defaults(func=cmd_today_history)
 
     # focus — focus blocks -----------------------------------------------------
     p_focus = sub.add_parser("focus", help="focus block (suppresses nudges while on-goal)")
@@ -750,6 +829,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.set_defaults(func=cmd_goals_show)
     q = goals_sub.add_parser("write", help="overwrite goals.md from STDIN (atomic), then summarize")
     q.set_defaults(func=cmd_goals_write)
+    q = goals_sub.add_parser("archive", help="retire a goal by id (excluded from alignment)")
+    q.add_argument("goal_id", metavar="GOAL-ID", help="goal slug id (see `dayloop goals`)")
+    q.set_defaults(func=cmd_goals_archive)
+    q = goals_sub.add_parser("unarchive", help="reactivate an archived goal by id")
+    q.add_argument("goal_id", metavar="GOAL-ID", help="goal slug id (see `dayloop goals`)")
+    q.set_defaults(func=cmd_goals_unarchive)
 
     p = sub.add_parser("doctor", help="check external tools + services, print a checklist")
     p.set_defaults(func=cmd_doctor)

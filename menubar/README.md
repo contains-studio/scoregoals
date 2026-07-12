@@ -31,9 +31,13 @@ engine is erroring, so a frozen number never looks live.
    reachable"; it lights up once screenpipe is present.
 3. **TODAY'S THREE** — your top-3 intentions as a checkable list. Each row has a
    checkbox (tap to flip done → `today toggle <id>`), the intention text, a small
-   bar of attributed minutes, its earning apps, and the minute total. When no
-   intentions are set yet, an inline three-field editor appears with a **Set
-   today's 3** button (→ `today set "a|b|c"`).
+   bar of attributed minutes, its earning apps, and the minute total. Items
+   carried over from yesterday's undone work show a subtle ↩ marker. The header
+   shows the 7-day completion rate (`67% / 7d`), and a **History** disclosure
+   expands to the last 7 days as compact `Mon d — n/n` rows (from `today history
+   --json`; a ↩ flags days that had carried-over items). When no intentions are
+   set yet, an inline three-field editor appears with a **Set today's 3** button
+   (→ `today set "a|b|c"`).
 4. **FOCUS** — if a block is active, the focus goal + remaining time + a **Stop**
    button (→ `focus stop`). Otherwise a **Start focus block** menu of your current
    goals with a minutes stepper (10–120, default 50) (→ `focus start <goal-id>
@@ -56,6 +60,7 @@ engine is erroring, so a frozen number never looks live.
 |------------------------------------|----------------------------------------------|
 | Intention checkbox                 | `today toggle <id>`                          |
 | "Set today's 3" editor             | `today set "a\|b\|c"`                         |
+| History disclosure                 | `today history --days 7 --json`              |
 | Start focus block (goal menu)      | `focus start <goal-id> --minutes <N>`        |
 | Stop (focus)                       | `focus stop`                                 |
 | Capture now                        | `capture <today>`                            |
@@ -65,6 +70,7 @@ engine is erroring, so a frozen number never looks live.
 | Settings: nudges / pause capture   | `config set nudges_enabled\|capture_paused <bool>` |
 | Settings: refresh cadence          | `config set refresh_seconds <n>` + live re-poll |
 | Settings: Save goals               | `goals write` (new markdown piped on **stdin**) |
+| Settings: Archive / Unarchive goal | `goals archive\|unarchive <goal-id>`         |
 
 Reads are `status --json` (every poll), `config --json` (on launch + when Settings
 opens), and `goals --json` (when the Goals editor loads). `report`'s backend is
@@ -92,7 +98,11 @@ Open **Settings…** from the gear menu. It loads current values from
   …)` — or an error inline, and re-polls so the day score reflects the new goals.
   **Reload** re-fetches from disk; **Open file** opens `goals.md` in your default
   editor. Saving never rejects: content that parses to zero goals is still written
-  (the engine warns), so a mid-draft file is never lost.
+  (the engine warns), so a mid-draft file is never lost. Below the raw editor a
+  compact **per-goal list** (name + target, with an `archived` tag) offers a
+  one-click **Archive / Unarchive** button per goal (→ `goals archive|unarchive
+  <goal-id>`) — archived goals stay in the file but drop out of alignment,
+  targets, and drift. The raw editor remains the power path.
 - **Engine location** — a repo directory or engine binary, persisted in
   UserDefaults (key `dayloopEnginePath`) and used by `DayloopClient` so
   `$DAYLOOP_BIN` is no longer the only override. "Apply path" rebuilds the engine

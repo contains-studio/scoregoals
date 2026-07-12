@@ -94,6 +94,7 @@ class Goal:
     description: str = ""
     keywords: list[str] = field(default_factory=list)
     target_pct: float | None = None
+    archived: bool = False  # retired goal: kept in goals.md, excluded from alignment
 
 
 @dataclass

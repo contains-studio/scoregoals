@@ -7,12 +7,18 @@ Format, one goal per section:
   keywords: comma, separated, keywords      <- matched (case-insensitive) against
                                                session app/title/project/topic/summary/excerpt
   target_pct: 30                            <- optional; % of ACTIVE time you want on this goal
+  archived: true                            <- optional; retires the goal (see below)
   <description paragraph — free text, fed to the LLM for context>
 
 Notes:
 - Each session counts toward AT MOST ONE goal (most distinct keyword hits
   wins; ties break by the order below) — see compare/align.py. Targets still
   need not sum to 100.
+- Archiving: add an "archived: true" line to a goal to retire it. Archived
+  goals stay in this file (history is preserved) but are EXCLUDED from
+  alignment, targets, and drift. Toggle from the CLI without hand-editing:
+  `dayloop goals archive <goal-id>` / `dayloop goals unarchive <goal-id>`
+  (goal-id is the slug shown by `dayloop goals`). Past reports are untouched.
 - Edit freely; changes apply on the next capture/analyze run.
 -->
 

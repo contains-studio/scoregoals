@@ -158,7 +158,7 @@ scheduled, or the day's events are all in the past). Otherwise:
     { "goal_id": "unaligned", "goal_name": "Unaligned", "minutes": 32.0, "pct_time": 10.5, "target_pct": null, "on_track": true }
   ],
   "drift_flags": [ "No time on 'Deep work / coding' (target 50%)" ],
-  "intentions": { "date": "2026-07-11", "set_at": null, "items": [] },
+  "intentions": { "date": "2026-07-11", "set_at": null, "items": [], "history_summary": { "days": 7, "completion_rate": 0.0 } },
   "focus": { "active": false, "goal_id": null, "goal_name": null, "started_at": null, "until": null },
   "next_event": null,
   "week": { "scores": [null, null, null, null, 75, 0, 75], "on_track_days": 2, "sparkline": "····▇▁▇" },
@@ -189,6 +189,7 @@ from today's aligned sessions. Stored at `data/intentions/<date>.json`; the
 | `date` | string `YYYY-MM-DD` | the day |
 | `set_at` | string (ISO) \| null | when intentions were established; null if none |
 | `items` | array of object | 0–3 items (see below) |
+| `history_summary` | object | cheap 7-day completion rollup (see below) |
 
 `items[]`:
 
@@ -201,10 +202,20 @@ from today's aligned sessions. Stored at `data/intentions/<date>.json`; the
 | `done` | bool | completion flag |
 | `attributed_minutes` | number | minutes today's sessions attributed to `goal_id` (0 when `goal_id` is null); when several intentions share one `goal_id`, that goal's minutes are split **evenly** across them, so their sum equals the goal's real minutes rather than double-counting |
 | `apps` | array of string | distinct apps that earned that time (empty when unmatched) |
+| `carried_from` | string `YYYY-MM-DD` \| null | the day this item was carried over from (yesterday's undone work, seeded by the morning plan); null for items set today |
+
+`history_summary`:
+
+| field | type | notes |
+|------|------|------|
+| `days` | int | window size (default 7) |
+| `completion_rate` | number 0–1 | done items ÷ total items over the last `days` (0.0 when the window has no items); computed cheaply from the intention files only |
 
 Related write commands (human-readable stdout, not JSON): `today set "a|b|c"`
 (replace up to 3, auto-link each), `today add "text" [--goal ID]`,
-`today toggle <id-or-1based-index>`, `today clear`. Bare `today` pretty-prints.
+`today toggle <id-or-1based-index>`, `today clear [--keep-history]` (removes only
+today's items — past days' files are always kept). Bare `today` pretty-prints.
+Yesterday's UNDONE items are carried over into today's plan (see `carried_from`).
 
 ### Example
 
@@ -213,9 +224,54 @@ Related write commands (human-readable stdout, not JSON): `today set "a|b|c"`
   "date": "2026-07-11",
   "set_at": "2026-07-11T18:51:33-07:00",
   "items": [
-    { "id": "97e0e320", "text": "Finish menu bar app", "goal_id": null, "goal_name": null, "done": true, "attributed_minutes": 0.0, "apps": [] },
-    { "id": "8c4c46a3", "text": "Investor follow-ups", "goal_id": "investor-partner-comms", "goal_name": "Investor & partner comms", "done": false, "attributed_minutes": 94.0, "apps": ["Mail", "zoom.us", "Slack"] },
-    { "id": "9a4b3739", "text": "Read screenpipe docs", "goal_id": "ship-dayloop", "goal_name": "Ship dayloop", "done": false, "attributed_minutes": 131.0, "apps": ["Code", "Google Chrome"] }
+    { "id": "97e0e320", "text": "Finish menu bar app", "goal_id": null, "goal_name": null, "done": true, "attributed_minutes": 0.0, "apps": [], "carried_from": null },
+    { "id": "8c4c46a3", "text": "Investor follow-ups", "goal_id": "investor-partner-comms", "goal_name": "Investor & partner comms", "done": false, "attributed_minutes": 94.0, "apps": ["Mail", "zoom.us", "Slack"], "carried_from": "2026-07-10" },
+    { "id": "9a4b3739", "text": "Read screenpipe docs", "goal_id": "ship-dayloop", "goal_name": "Ship dayloop", "done": false, "attributed_minutes": 131.0, "apps": ["Code", "Google Chrome"], "carried_from": null }
+  ],
+  "history_summary": { "days": 7, "completion_rate": 0.6 }
+}
+```
+
+---
+
+## `dayloop today history [--days N] [--json]`
+
+Past intentions plus a completion rate, for the last `days` (default 7) ending
+today, **newest day first**. `--json` emits the object below; without it, a
+human-readable list is printed. Read-only — it never mutates any file. Clearing
+today (`today clear`) never deletes past days' files, so history is the archive.
+
+| field | type | notes |
+|------|------|------|
+| `days` | int | window size requested |
+| `end_date` | string `YYYY-MM-DD` | most recent day in the window (today by default) |
+| `items_total` | int | total intentions across the window |
+| `items_done` | int | completed intentions across the window |
+| `completion_rate` | number 0–1 | `items_done / items_total` (0.0 when empty) |
+| `days_list` | array of object | one entry per day, newest first (see below) |
+
+`days_list[]`:
+
+| field | type | notes |
+|------|------|------|
+| `date` | string `YYYY-MM-DD` | the day |
+| `set_at` | string (ISO) \| null | when that day's intentions were set |
+| `n_done` | int | completed items that day |
+| `n_total` | int | total items that day |
+| `items` | array of object | `{ id, text, done, attributed_minutes, goal_name, carried_from }` |
+
+### Example
+
+```json
+{
+  "days": 7,
+  "end_date": "2026-07-11",
+  "items_total": 12,
+  "items_done": 8,
+  "completion_rate": 0.667,
+  "days_list": [
+    { "date": "2026-07-11", "set_at": "2026-07-11T09:00:00-07:00", "n_done": 1, "n_total": 3,
+      "items": [ { "id": "8c4c46a3", "text": "Investor follow-ups", "done": false, "attributed_minutes": 94.0, "goal_name": "Investor & partner comms", "carried_from": "2026-07-10" } ] }
   ]
 }
 ```
@@ -300,7 +356,7 @@ its verbatim text, and the parsed goals. The Swift app loads `raw` into a
 |------|------|------|
 | `path` | string | absolute path to `goals.md` |
 | `raw` | string | the file's verbatim UTF-8 text (`""` if unreadable) |
-| `goals` | array of object | parsed goals in `goals.md` order (may be empty) |
+| `goals` | array of object | parsed goals in `goals.md` order (may be empty); **includes archived goals** |
 
 `goals[]`:
 
@@ -310,13 +366,16 @@ its verbatim text, and the parsed goals. The Swift app loads `raw` into a
 | `name` | string | display name from the `## Goal: <name>` heading |
 | `keywords` | array of string | lowercased keywords for session matching |
 | `target_pct` | number \| null | desired % of active time; null when untargeted |
+| `archived` | bool | `true` for a retired goal (`archived: true` in goals.md). Archived goals are **excluded** from alignment/targets/drift, but still listed here so the editor can unarchive them |
 
 Related commands (human-readable stdout, not JSON): `goals show --raw` prints the
 file verbatim; `goals write` reads new markdown from **STDIN**, atomically
 overwrites `goals.md` (temp file + rename), then prints a one-line summary
 `wrote goals.md (N goals: id1, id2, …)`. The write **never rejects**: if the new
 content parses to zero goals it is still written and a warning goes to stderr
-(the file may be mid-draft). Bare `dayloop goals` pretty-prints the summary.
+(the file may be mid-draft). `goals archive <goal-id>` / `goals unarchive
+<goal-id>` toggle a goal's `archived:` line in place (atomic write). Bare
+`dayloop goals` pretty-prints the summary (archived goals tagged `[archived]`).
 
 ### Example
 

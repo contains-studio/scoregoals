@@ -46,9 +46,15 @@ final class StatusStore: ObservableObject {
     /// Verbatim goals.md text (the `raw` field of `goals --json`), loaded on
     /// demand by the Settings Goals editor.
     @Published private(set) var goalsRaw: String = ""
+    /// Parsed goals (incl. archived, flagged) from `goals --json`, driving the
+    /// compact per-goal Archive/Unarchive list under the raw editor.
+    @Published private(set) var goalsList: [GoalSummary] = []
     /// True once `goals --json` has returned at least once, so the editor knows
     /// the empty string means "no goals yet" rather than "not loaded".
     @Published private(set) var goalsLoaded: Bool = false
+    /// Intentions history (`today history --json`), loaded on demand by the
+    /// popover's History disclosure. Nil until first loaded.
+    @Published private(set) var history: IntentionsHistory? = nil
     /// Keys of write actions currently in flight (e.g. "today", "focus", "capture").
     @Published private(set) var busyActions: Set<String> = []
     /// The last write action's result, shown inline; auto-clears on the next action.
@@ -264,7 +270,7 @@ final class StatusStore: ObservableObject {
 
     // Goals editor ------------------------------------------------------------
 
-    /// Load goals.md into `goalsRaw` via `goals --json` (the `raw` field).
+    /// Load goals.md into `goalsRaw` + `goalsList` via `goals --json`.
     func loadGoals() {
         Task {
             let result = await client.runAsync(["goals", "--json"], timeout: 8)
@@ -272,7 +278,30 @@ final class StatusStore: ObservableObject {
                let data = text.data(using: .utf8),
                let payload = try? JSONDecoder().decode(GoalsFile.self, from: data) {
                 self.goalsRaw = payload.raw
+                self.goalsList = payload.goals
                 self.goalsLoaded = true
+            }
+        }
+    }
+
+    /// Archive or unarchive a goal by id (edits goals.md in place), then reload
+    /// the goals list + raw text and re-poll so the day score reflects the change.
+    func setGoalArchived(_ goalId: String, archived: Bool) {
+        let verb = archived ? "archive" : "unarchive"
+        perform("goals", ["goals", verb, goalId],
+                notice: "\(archived ? "archived" : "unarchived") \(goalId)") { [weak self] _ in
+            self?.loadGoals()
+        }
+    }
+
+    /// Load the intentions history (`today history --json`) for the disclosure.
+    func loadHistory(days: Int = 7) {
+        Task {
+            let result = await client.runAsync(["today", "history", "--days", "\(days)", "--json"], timeout: 8)
+            if case .success(let text) = result,
+               let data = text.data(using: .utf8),
+               let payload = try? JSONDecoder().decode(IntentionsHistory.self, from: data) {
+                self.history = payload
             }
         }
     }

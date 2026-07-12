@@ -8,7 +8,11 @@ goals.md format:
     ## Goal: <name>
     keywords: a, b, c
     target_pct: 30            (optional)
+    archived: true            (optional — retires the goal, see below)
     <free-text description paragraph(s)>
+
+Archived goals are parsed but excluded from alignment/targets/drift by default;
+load_goals(include_archived=True) returns them too (each Goal carries .archived).
 
 Matching strategy (see align()):
     Each Session is assigned to AT MOST ONE goal. A goal matches a session
@@ -22,8 +26,11 @@ Matching strategy (see align()):
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+import tempfile
+from pathlib import Path
 
 from ..config import Config
 from ..models import DayTimeline, Goal, GoalAlignment, Session
@@ -50,15 +57,20 @@ def _slug(name: str) -> str:
     return s or "goal"
 
 
-def load_goals(config: Config) -> list[Goal]:
+def load_goals(config: Config, include_archived: bool = False) -> list[Goal]:
     """Parse config.goals_path (goals.md) into Goals.
 
     Recognized inside each "## Goal: <name>" section:
       - "keywords: a, b, c"  -> lowercased, stripped, comma-split
       - "target_pct: 30"     -> float (invalid values ignored with a warning)
+      - "archived: true"     -> bool; archived goals are retired
       - any other non-heading text -> appended to the description
     id is a slug of the name; duplicate slugs get -2, -3, ... suffixes.
     Missing/unreadable file -> one-line warning + [] (pipeline continues).
+
+    By default only ACTIVE goals are returned (archived ones are excluded from
+    alignment/targets/drift). Pass include_archived=True to get every goal with
+    its `.archived` flag set (used by the `goals --json` editing surface).
     """
     try:
         with open(config.goals_path, encoding="utf-8") as fh:
@@ -106,13 +118,92 @@ def load_goals(config: Config) -> list[Goal]:
                 current.target_pct = float(val)
             except ValueError:
                 _warn(f"goal '{current.name}': ignoring bad target_pct {val!r}")
+        elif lower.startswith("archived:"):
+            val = stripped.split(":", 1)[1].strip().lower()
+            current.archived = val in ("true", "yes", "1", "on")
         elif stripped and not stripped.startswith("#"):
             desc_lines.append(stripped)
     _finish()
 
     if not goals:
         _warn(f"no goals parsed from {config.goals_path}")
+    if not include_archived:
+        return [g for g in goals if not g.archived]
     return goals
+
+
+def set_archived(config: Config, goal_id: str, archived: bool) -> bool:
+    """Toggle the `archived:` flag on the goals.md section whose slug id equals
+    `goal_id`, editing the markdown in place with an atomic temp-file + rename.
+
+    Archiving inserts an `archived: true` line right after the goal's heading;
+    unarchiving removes any `archived:` line from that section. Returns True when
+    the goal was found (and the file rewritten), False otherwise. Historical
+    reports that referenced the goal are untouched — only goals.md changes.
+    """
+    path = Path(config.goals_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _warn(f"goals file not readable ({config.goals_path}): {exc}")
+        return False
+
+    heading_re = re.compile(r"^##\s*Goal\s*:\s*(.+?)\s*$", re.IGNORECASE)
+    archived_re = re.compile(r"^\s*archived\s*:", re.IGNORECASE)
+
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    seen_ids: set[str] = set()
+    in_target = False
+    found = False
+    inserted = False
+
+    for raw in lines:
+        m = heading_re.match(raw.rstrip("\n"))
+        if m:
+            # New section begins — resolve its id the same way load_goals does.
+            gid = base = _slug(m.group(1))
+            n = 2
+            while gid in seen_ids:
+                gid, n = f"{base}-{n}", n + 1
+            seen_ids.add(gid)
+            in_target = gid == goal_id
+            out.append(raw)
+            if in_target:
+                found = True
+                inserted = False
+                if archived:
+                    # Insert immediately after the heading, matching its newline.
+                    nl = "\n" if raw.endswith("\n") else "\n"
+                    out.append(f"archived: true{nl}")
+                    inserted = True
+            continue
+        if in_target and archived_re.match(raw):
+            # Drop any existing archived line in the target section (avoids dups
+            # when archiving, and performs the removal when unarchiving).
+            continue
+        out.append(raw)
+
+    if not found:
+        return False
+
+    new_text = "".join(out)
+    if new_text == text and (archived and not inserted):
+        return True  # nothing to change
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".goals-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new_text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return True
 
 
 def _keyword_hits(keywords: list[str], haystack: str) -> int:

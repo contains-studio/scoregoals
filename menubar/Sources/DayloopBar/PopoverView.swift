@@ -15,6 +15,7 @@ struct PopoverView: View {
     @ObservedObject var store: StatusStore
     @Environment(\.openWindow) private var openWindow
     @State private var focusMinutes = 50
+    @State private var showHistory = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -158,7 +159,16 @@ struct PopoverView: View {
 
     private var intentionsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionHeader("TODAY'S THREE")
+            HStack {
+                sectionHeader("TODAY'S THREE")
+                Spacer()
+                if let rate = store.status?.intentions.historySummary?.completionRate {
+                    Text("\(Int((rate * 100).rounded()))% / 7d")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .help("7-day intention completion rate")
+                }
+            }
             let items = store.status?.intentions.items ?? []
             if items.isEmpty {
                 IntentionsEditor(store: store)
@@ -168,7 +178,58 @@ struct PopoverView: View {
                     IntentionRow(item: item, maxMinutes: maxAttr, store: store)
                 }
             }
+            historyDisclosure
         }
+    }
+
+    /// Compact "History" disclosure: the last 7 days as `date — n/n done` rows,
+    /// loaded from `today history --json` the first time it's opened.
+    private var historyDisclosure: some View {
+        DisclosureGroup(isExpanded: $showHistory) {
+            if let hist = store.history {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(hist.daysList) { day in
+                        HStack(spacing: 6) {
+                            Text(shortDay(day.date))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 52, alignment: .leading)
+                            if day.items.contains(where: { $0.carriedFrom != nil }) {
+                                Image(systemName: "arrow.uturn.backward")
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.tertiary)
+                                    .help("has carried-over items")
+                            }
+                            Spacer()
+                            Text(day.nTotal == 0 ? "—" : "\(day.nDone)/\(day.nTotal)")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(day.nTotal > 0 && day.nDone == day.nTotal ? .green : .secondary)
+                        }
+                    }
+                }
+                .padding(.top, 3)
+            } else {
+                Text("loading…").font(.caption2).foregroundStyle(.tertiary)
+            }
+        } label: {
+            Text("History")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .onChange(of: showHistory) { _, open in
+            if open { store.loadHistory() }
+        }
+    }
+
+    /// "2026-07-11" -> "Jul 11" for the compact history rows.
+    private func shortDay(_ iso: String) -> String {
+        guard let d = StatusStore.parseISO(iso + "T00:00:00") else {
+            return String(iso.suffix(5))  // MM-DD fallback
+        }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM d"
+        return f.string(from: d)
     }
 
     // MARK: - 4. FOCUS
@@ -441,11 +502,19 @@ struct IntentionRow: View {
             .disabled(busy)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(item.text)
-                    .font(.callout)
-                    .strikethrough(item.done, color: .secondary)
-                    .foregroundStyle(item.done ? .secondary : .primary)
-                    .lineLimit(2)
+                HStack(spacing: 4) {
+                    if let carried = item.carriedFrom {
+                        Image(systemName: "arrow.uturn.backward")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                            .help("carried over from \(carried)")
+                    }
+                    Text(item.text)
+                        .font(.callout)
+                        .strikethrough(item.done, color: .secondary)
+                        .foregroundStyle(item.done ? .secondary : .primary)
+                        .lineLimit(2)
+                }
                 if item.attributedMinutes > 0 {
                     MiniBar(fraction: item.attributedMinutes / maxMinutes,
                             tint: item.done ? .secondary : .accentColor)

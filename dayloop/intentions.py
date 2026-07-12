@@ -16,12 +16,26 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+from datetime import date as _date
+from datetime import timedelta
 from pathlib import Path
 
 from .config import Config
 from .models import iso_now
 
 MAX_ITEMS = 3
+HISTORY_DAYS = 7
+
+
+def _today() -> str:
+    return _date.today().isoformat()
+
+
+def _prev_day(date: str) -> str:
+    try:
+        return (_date.fromisoformat(date) - timedelta(days=1)).isoformat()
+    except ValueError:
+        return date
 
 
 def _dir(config: Config) -> Path:
@@ -69,6 +83,7 @@ def load(config: Config, date: str) -> dict:
                     "goal_id": it.get("goal_id"),
                     "done": bool(it.get("done")),
                     "created_at": it.get("created_at") or iso_now(),
+                    "carried_from": it.get("carried_from"),
                 }
             )
     return {
@@ -115,6 +130,7 @@ def set_items(config: Config, date: str, texts: list[str], goals=None) -> dict:
                 "goal_id": _link(text, goals),
                 "done": False,
                 "created_at": iso_now(),
+                "carried_from": None,
             }
         )
         if len(items) >= MAX_ITEMS:
@@ -139,6 +155,7 @@ def add_item(config: Config, date: str, text: str, goal_id: str | None = None, g
             "goal_id": goal_id or _link(text, goals),
             "done": False,
             "created_at": iso_now(),
+            "carried_from": None,
         }
     )
     if not record.get("set_at"):
@@ -176,13 +193,69 @@ def clear(config: Config, date: str) -> dict:
     return _save(config, date, _empty(date))
 
 
+def _carryover_items(config: Config, date: str, goals) -> list[dict]:
+    """Yesterday's UNDONE intentions, rebuilt as fresh items for `date` and
+    tagged with meta `carried_from` = the previous day. Empty when yesterday had
+    no undone work (or no file)."""
+    prev = _prev_day(date)
+    out: list[dict] = []
+    for it in load(config, prev)["items"]:
+        text = (it.get("text") or "").strip()
+        if it.get("done") or not text:
+            continue
+        out.append(
+            {
+                "id": _new_id(),
+                "text": text,
+                "goal_id": it.get("goal_id") or _link(text, goals),
+                "done": False,
+                "created_at": iso_now(),
+                "carried_from": prev,
+            }
+        )
+    return out
+
+
 def prefill(config: Config, date: str, texts: list[str], goals=None) -> dict:
     """Seed up to MAX_ITEMS intentions ONLY when the day has none yet (used by
-    the morning plan). Returns the resulting record either way."""
+    the morning plan). Yesterday's UNDONE items are carried over FIRST (tagged
+    with `carried_from`), then `texts` fill any remaining slots. Text-level
+    de-dup means a suggestion already carried over is never added twice.
+    Returns the resulting record either way."""
     record = load(config, date)
     if record["items"]:
         return record
-    return set_items(config, date, texts, goals=goals)
+
+    goals = _load_goals(config, goals)
+    items: list[dict] = []
+    seen: set[str] = set()
+    for item in _carryover_items(config, date, goals):
+        key = item["text"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+        if len(items) >= MAX_ITEMS:
+            break
+    for text in texts:
+        text = (text or "").strip()
+        if not text or text.lower() in seen:
+            continue
+        seen.add(text.lower())
+        items.append(
+            {
+                "id": _new_id(),
+                "text": text,
+                "goal_id": _link(text, goals),
+                "done": False,
+                "created_at": iso_now(),
+                "carried_from": None,
+            }
+        )
+        if len(items) >= MAX_ITEMS:
+            break
+
+    return _save(config, date, {"date": date, "set_at": iso_now(), "items": items})
 
 
 def block(config: Config, date: str, timeline=None, goals=None) -> dict:
@@ -236,6 +309,87 @@ def block(config: Config, date: str, timeline=None, goals=None) -> dict:
                 "done": bool(it["done"]),
                 "attributed_minutes": round(float(attr.get("minutes", 0.0)) / share, 1),
                 "apps": list(attr.get("apps", [])),
+                "carried_from": it.get("carried_from"),
             }
         )
-    return {"date": record["date"], "set_at": record.get("set_at"), "items": items_out}
+    return {
+        "date": record["date"],
+        "set_at": record.get("set_at"),
+        "items": items_out,
+        "history_summary": history_summary(config, days=HISTORY_DAYS, end_date=date),
+    }
+
+
+def history_summary(config: Config, days: int = HISTORY_DAYS, end_date: str | None = None) -> dict:
+    """Cheap completion-rate rollup over the last `days` (file reads only, no
+    timeline/attribution). completion_rate = done_items / total_items across the
+    window (0.0 when the window has no items)."""
+    end = end_date or _today()
+    try:
+        base = _date.fromisoformat(end)
+    except ValueError:
+        base = _date.today()
+    total = 0
+    done = 0
+    for i in range(max(1, days)):
+        rec = load(config, (base - timedelta(days=i)).isoformat())
+        for it in rec["items"]:
+            total += 1
+            if it.get("done"):
+                done += 1
+    rate = round(done / total, 3) if total else 0.0
+    return {"days": days, "completion_rate": rate}
+
+
+def history(config: Config, days: int = HISTORY_DAYS, end_date: str | None = None, goals=None) -> dict:
+    """The intentions history for the last `days` ending at `end_date` (default
+    today), newest day first. Each day carries its enriched items (text, done,
+    attributed_minutes, carried_from) plus n_done/n_total, and the block ends
+    with an overall completion-rate summary.
+    """
+    end = end_date or _today()
+    try:
+        base = _date.fromisoformat(end)
+    except ValueError:
+        base = _date.today()
+    goals = _load_goals(config, goals)
+
+    days_list: list[dict] = []
+    total = 0
+    done = 0
+    for i in range(max(1, days)):
+        d = (base - timedelta(days=i)).isoformat()
+        blk = block(config, d, goals=goals)
+        items = [
+            {
+                "id": it["id"],
+                "text": it["text"],
+                "done": it["done"],
+                "attributed_minutes": it["attributed_minutes"],
+                "goal_name": it.get("goal_name"),
+                "carried_from": it.get("carried_from"),
+            }
+            for it in blk["items"]
+        ]
+        n_total = len(items)
+        n_done = sum(1 for it in items if it["done"])
+        total += n_total
+        done += n_done
+        days_list.append(
+            {
+                "date": d,
+                "set_at": blk.get("set_at"),
+                "n_done": n_done,
+                "n_total": n_total,
+                "items": items,
+            }
+        )
+
+    return {
+        "days": days,
+        "end_date": end,
+        "items_total": total,
+        "items_done": done,
+        "completion_rate": round(done / total, 3) if total else 0.0,
+        "days_list": days_list,
+    }

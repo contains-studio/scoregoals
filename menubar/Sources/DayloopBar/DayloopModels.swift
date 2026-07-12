@@ -171,6 +171,7 @@ struct Intentions: Codable {
     var date: String = ""
     var setAt: String? = nil
     var items: [Item] = []
+    var historySummary: HistorySummary? = nil
 
     init() {}
 
@@ -178,6 +179,7 @@ struct Intentions: Codable {
         case date
         case setAt = "set_at"
         case items
+        case historySummary = "history_summary"
     }
 
     init(from decoder: Decoder) throws {
@@ -185,6 +187,26 @@ struct Intentions: Codable {
         date = c.tolerant(String.self, .date, "")
         setAt = c.optional(String.self, .setAt)
         items = c.tolerant([Item].self, .items, [])
+        historySummary = c.optional(HistorySummary.self, .historySummary)
+    }
+}
+
+/// The cheap 7-day completion-rate rollup embedded in `status.intentions`.
+struct HistorySummary: Codable {
+    var days: Int = 7
+    var completionRate: Double = 0
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case days
+        case completionRate = "completion_rate"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        days = c.tolerant(Int.self, .days, 7)
+        completionRate = c.tolerant(Double.self, .completionRate, 0)
     }
 }
 
@@ -196,6 +218,8 @@ struct Item: Codable, Identifiable {
     var done: Bool = false
     var attributedMinutes: Double = 0
     var apps: [String] = []
+    /// The date this item was carried over from (yesterday's undone work), or nil.
+    var carriedFrom: String? = nil
 
     init() {}
 
@@ -206,6 +230,7 @@ struct Item: Codable, Identifiable {
         case done
         case attributedMinutes = "attributed_minutes"
         case apps
+        case carriedFrom = "carried_from"
     }
 
     init(from decoder: Decoder) throws {
@@ -217,6 +242,7 @@ struct Item: Codable, Identifiable {
         done = c.tolerant(Bool.self, .done, false)
         attributedMinutes = c.tolerant(Double.self, .attributedMinutes, 0)
         apps = c.tolerant([String].self, .apps, [])
+        carriedFrom = c.optional(String.self, .carriedFrom)
     }
 }
 
@@ -381,23 +407,131 @@ struct DayloopConfig: Codable, Equatable {
 
 // MARK: - goals file (`goals --json`)
 
-/// The goals.md surface returned by `dayloop goals --json`: the file path and
-/// its verbatim text (the Goals editor loads `raw` into its TextEditor). The
-/// parsed `goals[]` array is present in the JSON but unused by the app.
+/// The goals.md surface returned by `dayloop goals --json`: the file path, its
+/// verbatim text (the Goals editor loads `raw` into its TextEditor), and the
+/// parsed `goals[]` (used by the compact per-goal Archive/Unarchive list).
 struct GoalsFile: Codable {
     var path: String = ""
     var raw: String = ""
+    var goals: [GoalSummary] = []
 
     init() {}
 
     enum CodingKeys: String, CodingKey {
-        case path, raw
+        case path, raw, goals
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         path = c.tolerant(String.self, .path, "")
         raw = c.tolerant(String.self, .raw, "")
+        goals = c.tolerant([GoalSummary].self, .goals, [])
+    }
+}
+
+/// One parsed goal from `goals --json` (includes archived goals, flagged).
+struct GoalSummary: Codable, Identifiable {
+    var goalId: String = ""
+    var name: String = ""
+    var targetPct: Double? = nil
+    var archived: Bool = false
+
+    var id: String { goalId }
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case goalId = "id"
+        case name
+        case targetPct = "target_pct"
+        case archived
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        goalId = c.tolerant(String.self, .goalId, "")
+        name = c.tolerant(String.self, .name, "")
+        targetPct = c.optional(Double.self, .targetPct)
+        archived = c.tolerant(Bool.self, .archived, false)
+    }
+}
+
+// MARK: - intentions history (`today history --json`)
+
+/// The history rollup returned by `dayloop today history --json`: per-day rows
+/// plus an overall completion rate. Drives the "History" disclosure.
+struct IntentionsHistory: Codable {
+    var days: Int = 7
+    var itemsTotal: Int = 0
+    var itemsDone: Int = 0
+    var completionRate: Double = 0
+    var daysList: [HistoryDay] = []
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case days
+        case itemsTotal = "items_total"
+        case itemsDone = "items_done"
+        case completionRate = "completion_rate"
+        case daysList = "days_list"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        days = c.tolerant(Int.self, .days, 7)
+        itemsTotal = c.tolerant(Int.self, .itemsTotal, 0)
+        itemsDone = c.tolerant(Int.self, .itemsDone, 0)
+        completionRate = c.tolerant(Double.self, .completionRate, 0)
+        daysList = c.tolerant([HistoryDay].self, .daysList, [])
+    }
+}
+
+struct HistoryDay: Codable, Identifiable {
+    var date: String = ""
+    var nDone: Int = 0
+    var nTotal: Int = 0
+    var items: [HistoryItem] = []
+
+    var id: String { date }
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case nDone = "n_done"
+        case nTotal = "n_total"
+        case items
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        date = c.tolerant(String.self, .date, "")
+        nDone = c.tolerant(Int.self, .nDone, 0)
+        nTotal = c.tolerant(Int.self, .nTotal, 0)
+        items = c.tolerant([HistoryItem].self, .items, [])
+    }
+}
+
+struct HistoryItem: Codable, Identifiable {
+    var id: String = ""
+    var text: String = ""
+    var done: Bool = false
+    var carriedFrom: String? = nil
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case id, text, done
+        case carriedFrom = "carried_from"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.tolerant(String.self, .id, UUID().uuidString)
+        text = c.tolerant(String.self, .text, "")
+        done = c.tolerant(Bool.self, .done, false)
+        carriedFrom = c.optional(String.self, .carriedFrom)
     }
 }
 

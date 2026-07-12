@@ -161,6 +161,16 @@ struct SettingsView: View {
                         .foregroundStyle(msg.isError ? .red : .green)
                         .lineLimit(2)
                 }
+
+                if !store.goalsList.isEmpty {
+                    Divider()
+                    Text("Retire goals without editing the file — archived goals stay in goals.md but drop out of alignment, targets, and drift.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    ForEach(store.goalsList) { goal in
+                        GoalArchiveRow(goal: goal, store: store)
+                    }
+                }
             }
 
             Section("Engine location") {
@@ -262,6 +272,48 @@ struct SettingsView: View {
             loginEnabled = LoginItem.isEnabled
             loginHint = "Couldn't \(on ? "enable" : "disable") login item: "
                 + "\(error.localizedDescription). Move DayloopBar.app to /Applications and try again."
+        }
+    }
+}
+
+/// One compact goal row in the Settings Goals list: name + target, an
+/// "archived" tag when retired, and an Archive/Unarchive button that edits
+/// goals.md in place via the engine.
+struct GoalArchiveRow: View {
+    let goal: GoalSummary
+    @ObservedObject var store: StatusStore
+
+    private var busy: Bool { store.busyActions.contains("goals") }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(goal.name)
+                        .font(.callout)
+                        .foregroundStyle(goal.archived ? .secondary : .primary)
+                        .strikethrough(goal.archived, color: .secondary)
+                        .lineLimit(1)
+                    if goal.archived {
+                        Text("archived")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                    }
+                }
+                if let target = goal.targetPct {
+                    Text("target \(Int(target.rounded()))%")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Spacer()
+            Button(goal.archived ? "Unarchive" : "Archive") {
+                store.setGoalArchived(goal.goalId, archived: !goal.archived)
+            }
+            .font(.caption)
+            .disabled(busy)
         }
     }
 }
