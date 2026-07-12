@@ -22,8 +22,12 @@ swiftc -O -target "${ARCH}-apple-macosx13.0" -o "${SCRIPT_DIR}/${APP_NAME}" laun
 
 echo "==> assembling ${APP_NAME}.app"
 rm -rf "${APP_DIR}"
-mkdir -p "${MACOS_DIR}"
+mkdir -p "${MACOS_DIR}" "${APP_DIR}/Contents/Resources"
 mv "${SCRIPT_DIR}/${APP_NAME}" "${MACOS_DIR}/${APP_NAME}"
+# Official screenpipe logo (extracted from the screenpipe source release zip).
+if [[ -f "${SCRIPT_DIR}/ScreenpipeRecorder.icns" ]]; then
+  cp "${SCRIPT_DIR}/ScreenpipeRecorder.icns" "${APP_DIR}/Contents/Resources/"
+fi
 
 cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,6 +43,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>           <string>1.0.0</string>
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>LSUIElement</key>               <true/>
+    <key>CFBundleIconFile</key>          <string>ScreenpipeRecorder</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Screenpipe Recorder transcribes meetings and audio locally for your ScoreGoals timeline.</string>
 </dict>
