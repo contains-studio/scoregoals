@@ -131,6 +131,9 @@ secret that redaction would have caught.
 (ISO\|null), `app`, `title` (redacted), `text` (redacted), `frame_id`
 (int\|null), `speaker` (redacted\|null).
 
+**The `error` key is present ONLY on failure** — on success it is omitted
+entirely, so read it as `result.get("error")`, never `result["error"]`.
+
 **Unreachable screenpipe** (exit 0, empty results):
 
 ```json
