@@ -79,6 +79,22 @@ ollama pull huihui_ai/qwen3-abliterated:4b-thinking-2507-fp16
 Everything else (capture, aggregation, alignment, reports) still runs locally;
 only the model call is redirected.
 
+## Menu bar app
+
+A native macOS menu bar app lives in [`menubar/`](menubar/). It puts today's
+alignment score in your menu bar and shows a live popover (score, current
+activity, per-goal time breakdown, weekly sparkline, health) by polling
+`dayloop status --json`. It's a read-only viewer over the engine.
+
+```sh
+bash menubar/build.sh          # -> menubar/DayloopBar.app (ad-hoc signed)
+open menubar/DayloopBar.app    # first launch: right-click -> Open
+```
+
+See [`menubar/README.md`](menubar/README.md) for how it finds the engine,
+how to start it at login, and how it degrades when screenpipe/icalBuddy are
+absent (mock still works).
+
 ## Layout
 
 - `dayloop/models.py` — frozen data contracts (ActivityRecord, Session,

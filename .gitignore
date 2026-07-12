@@ -7,3 +7,7 @@ data/
 *.egg-info/
 dist/
 build/
+
+# menu bar app build products (commit source, not builds)
+menubar/.build/
+menubar/DayloopBar.app/
