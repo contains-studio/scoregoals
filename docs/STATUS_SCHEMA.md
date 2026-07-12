@@ -199,7 +199,7 @@ from today's aligned sessions. Stored at `data/intentions/<date>.json`; the
 | `goal_id` | string \| null | auto-linked (or explicit) goal id; null if no keyword match |
 | `goal_name` | string \| null | resolved from `goal_id`; null if unmatched/removed |
 | `done` | bool | completion flag |
-| `attributed_minutes` | number | minutes today's sessions attributed to `goal_id` (0 when `goal_id` is null) |
+| `attributed_minutes` | number | minutes today's sessions attributed to `goal_id` (0 when `goal_id` is null); when several intentions share one `goal_id`, that goal's minutes are split **evenly** across them, so their sum equals the goal's real minutes rather than double-counting |
 | `apps` | array of string | distinct apps that earned that time (empty when unmatched) |
 
 Related write commands (human-readable stdout, not JSON): `today set "a|b|c"`

@@ -188,7 +188,17 @@ def prefill(config: Config, date: str, texts: list[str], goals=None) -> dict:
 def block(config: Config, date: str, timeline=None, goals=None) -> dict:
     """The enriched intentions block for `today --json` / `status`: each item
     gains goal_name, attributed_minutes, and the apps that earned that time
-    today (by matching its goal_id to today's aligned sessions)."""
+    today (by matching its goal_id to today's aligned sessions).
+
+    A goal's tracked minutes are split **evenly** across the intentions that
+    share its goal_id, so two intentions auto-linked to the same goal each show
+    half its time rather than both claiming the full total (their sum stays
+    equal to the goal's real minutes instead of double-counting). Apps stay
+    shared — the same distinct apps earned that goal's time regardless of how
+    many intentions point at it.
+    """
+    from collections import Counter
+
     from .compare import align
 
     record = load(config, date)
@@ -207,11 +217,16 @@ def block(config: Config, date: str, timeline=None, goals=None) -> dict:
         except Exception as exc:  # never let attribution math break the block
             _warn(f"attribution failed ({exc})")
 
+    # How many intentions share each goal_id, so we can divide (not duplicate)
+    # that goal's attributed minutes across them.
+    share_counts = Counter(it.get("goal_id") for it in record["items"] if it.get("goal_id"))
+
     items_out: list[dict] = []
     for it in record["items"]:
         gid = it.get("goal_id")
         attr = attribution.get(gid, {}) if gid else {}
         goal = goals_by_id.get(gid) if gid else None
+        share = share_counts.get(gid, 1) or 1
         items_out.append(
             {
                 "id": it["id"],
@@ -219,7 +234,7 @@ def block(config: Config, date: str, timeline=None, goals=None) -> dict:
                 "goal_id": gid,
                 "goal_name": goal.name if goal else None,
                 "done": bool(it["done"]),
-                "attributed_minutes": round(float(attr.get("minutes", 0.0)), 1),
+                "attributed_minutes": round(float(attr.get("minutes", 0.0)) / share, 1),
                 "apps": list(attr.get("apps", [])),
             }
         )
