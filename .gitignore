@@ -10,7 +10,7 @@ build/
 
 # menu bar app build products (commit source, not builds)
 menubar/.build/
-menubar/DayloopBar.app/
+menubar/ScoreGoals.app/
 # recorder wrapper build products (rebuild with recorder/build.sh)
 recorder/ScreenpipeRecorder.app/
 recorder/ScreenpipeRecorder

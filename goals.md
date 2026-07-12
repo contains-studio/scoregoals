@@ -1,5 +1,5 @@
 <!--
-dayloop goals file — parsed by dayloop/compare/align.py (load_goals).
+ScoreGoals goals file — parsed by scoregoals/compare/align.py (load_goals).
 
 Format, one goal per section:
 
@@ -17,8 +17,8 @@ Notes:
 - Archiving: add an "archived: true" line to a goal to retire it. Archived
   goals stay in this file (history is preserved) but are EXCLUDED from
   alignment, targets, and drift. Toggle from the CLI without hand-editing:
-  `dayloop goals archive <goal-id>` / `dayloop goals unarchive <goal-id>`
-  (goal-id is the slug shown by `dayloop goals`). Past reports are untouched.
+  `scoregoals goals archive <goal-id>` / `scoregoals goals unarchive <goal-id>`
+  (goal-id is the slug shown by `scoregoals goals`). Past reports are untouched.
 - Edit freely; changes apply on the next capture/analyze run.
 -->
 

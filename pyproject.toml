@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dayloop"
+name = "scoregoals"
 version = "0.1.0"
 description = "Personal, local-first cybernetic activity tracker for macOS (screenpipe -> timeline -> goals -> feedback)"
 readme = "README.md"
@@ -23,7 +23,7 @@ gemini = ["google-genai"]
 macos = ["pyobjc"]
 
 [project.scripts]
-dayloop = "dayloop.cli:main"
+scoregoals = "scoregoals.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["dayloop"]
+packages = ["scoregoals"]

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scoregoals.weekly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__SCOREGOALS_BIN__</string>
+        <string>weekly</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__SCOREGOALS_REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__SCOREGOALS_BINDIR__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Weekly synthesis Sunday (Weekday 0) at 20:00. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>20</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/scoregoals/weekly.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/scoregoals/weekly.err.log</string>
+</dict>
+</plist>

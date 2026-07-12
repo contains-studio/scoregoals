@@ -1,9 +1,9 @@
-# DayloopBar — the dayloop menu bar app
+# ScoreGoals — the ScoreGoals menu bar app
 
 A tiny native macOS menu bar app (SwiftUI `MenuBarExtra`, no Xcode project — pure
-SwiftPM) that puts today's dayloop alignment score in your menu bar and gives you
-a live, **interactive** popover over the dayloop engine. It shells out to the
-`dayloop` CLI, polls `status --json` on a timer to render state, and drives the
+SwiftPM) that puts today's ScoreGoals alignment score in your menu bar and gives you
+a live, **interactive** popover over the ScoreGoals engine. It shells out to the
+`scoregoals` CLI, polls `status --json` on a timer to render state, and drives the
 engine's write commands (`today`, `focus`, `config`, `capture`, `report`, `plan`)
 straight from the UI. Every write runs off the main thread and re-polls the
 engine afterward, so what you see always reflects real engine state.
@@ -25,7 +25,7 @@ engine is erroring, so a frozen number never looks live.
 
 1. **Header** — big score `NN / 100`, an "on track / drifting / engine
    unavailable" line, the date, and a **gear menu** (Settings…, Refresh now,
-   Quit Dayloop).
+   Quit ScoreGoals).
 2. **NOW** — what you're doing right now (current app → mapped goal) with an
    on-task/off-task dot. With no live sensor it shows "no sensor / screenpipe not
    reachable"; it lights up once screenpipe is present.
@@ -56,7 +56,7 @@ engine is erroring, so a frozen number never looks live.
 
 ## How each control maps to the engine
 
-| UI control                         | dayloop command                              |
+| UI control                         | scoregoals command                              |
 |------------------------------------|----------------------------------------------|
 | Intention checkbox                 | `today toggle <id>`                          |
 | "Set today's 3" editor             | `today set "a\|b\|c"`                         |
@@ -104,8 +104,8 @@ Open **Settings…** from the gear menu. It loads current values from
   <goal-id>`) — archived goals stay in the file but drop out of alignment,
   targets, and drift. The raw editor remains the power path.
 - **Engine location** — a repo directory or engine binary, persisted in
-  UserDefaults (key `dayloopEnginePath`) and used by `DayloopClient` so
-  `$DAYLOOP_BIN` is no longer the only override. "Apply path" rebuilds the engine
+  UserDefaults (key `scoregoalsEnginePath`) and used by `ScoreGoalsClient` so
+  `$SCOREGOALS_BIN` is no longer the only override. "Apply path" rebuilds the engine
   client and re-polls; the resolved invocation is shown below the field.
 - **Launch at login** — see below.
 
@@ -115,8 +115,8 @@ The **Launch at login** toggle in Settings is a real login item backed by
 `SMAppService.mainApp` (`register()` / `unregister()`, reflecting `.status`). If
 registration fails — which can happen when the app is ad-hoc signed or run from
 outside `/Applications` — the error is caught and shown as a one-line hint
-("Move DayloopBar.app to /Applications and try again"); the app never crashes.
-For the most reliable behavior, move **DayloopBar.app** to `/Applications` before
+("Move ScoreGoals.app to /Applications and try again"); the app never crashes.
+For the most reliable behavior, move **ScoreGoals.app** to `/Applications` before
 enabling it.
 
 ## Build
@@ -125,14 +125,14 @@ enabling it.
 bash menubar/build.sh
 ```
 
-This runs `swift build -c release`, assembles `menubar/DayloopBar.app`
+This runs `swift build -c release`, assembles `menubar/ScoreGoals.app`
 (Contents/MacOS + Info.plist with `LSUIElement=1` so there's no Dock icon), and
 **ad-hoc code-signs** it (`codesign --sign -`). Output:
-`menubar/DayloopBar.app`. Requires only the Swift toolchain (macOS 14+).
+`menubar/ScoreGoals.app`. Requires only the Swift toolchain (macOS 14+).
 
 ## Run
 
-Double-click **DayloopBar.app** in Finder. Because it's ad-hoc signed (not
+Double-click **ScoreGoals.app** in Finder. Because it's ad-hoc signed (not
 notarized), the **first** launch Gatekeeper will block it — **right-click the app
 → Open**, then confirm. After that it opens normally.
 
@@ -144,35 +144,35 @@ notarized), the **first** launch Gatekeeper will block it — **right-click the 
 > the item.
 
 Look for the gauge + score at the top-right of your menu bar. Click it for the
-popover; use **Quit Dayloop** in the gear menu to exit.
+popover; use **Quit ScoreGoals** in the gear menu to exit.
 
 ### Run the binary directly (for debugging)
 
 ```sh
 # logs every engine call to a file
-DAYLOOP_BAR_DEBUG=/tmp/dayloopbar.log \
-  menubar/DayloopBar.app/Contents/MacOS/DayloopBar
+SCOREGOALS_BAR_DEBUG=/tmp/scoregoalsbar.log \
+  menubar/ScoreGoals.app/Contents/MacOS/ScoreGoals
 ```
 
 Env knobs:
 
-- `DAYLOOP_BAR_DEBUG=<path>` (or `=1` → `$TMPDIR/dayloopbar.log`) — append a
+- `SCOREGOALS_BAR_DEBUG=<path>` (or `=1` → `$TMPDIR/scoregoalsbar.log`) — append a
   timestamped line for every engine call and its result.
-- `DAYLOOP_REFRESH_SECONDS=<n>` — initial poll cadence (default 30, minimum 1).
+- `SCOREGOALS_REFRESH_SECONDS=<n>` — initial poll cadence (default 30, minimum 1).
   Settings' refresh-cadence picker overrides this at runtime.
-- `DAYLOOP_BIN=<path>` — hard override for the engine executable (see below).
+- `SCOREGOALS_BIN=<path>` — hard override for the engine executable (see below).
 
 ## How it finds the engine
 
 At launch (and whenever you Apply a new path in Settings) the app resolves how to
-invoke dayloop, in this order:
+invoke scoregoals, in this order:
 
-1. UserDefaults `dayloopEnginePath` (from Settings) — a **repo directory** (used
+1. UserDefaults `scoregoalsEnginePath` (from Settings) — a **repo directory** (used
    as the working dir + probed for `.venv/bin/…`) or an **executable binary**.
-2. `$DAYLOOP_BIN` if set and non-empty (run as-is; working dir = the resolved
+2. `$SCOREGOALS_BIN` if set and non-empty (run as-is; working dir = the resolved
    repo).
-3. `<repo>/.venv/bin/dayloop` — the venv console script, if present.
-4. `<repo>/.venv/bin/python -m dayloop` — module fallback.
+3. `<repo>/.venv/bin/scoregoals` — the venv console script, if present.
+4. `<repo>/.venv/bin/python -m scoregoals` — module fallback.
 
 It always runs the child with the repo as the working directory, so the engine
 finds `data/`, `config.toml`, and `goals.md`.
@@ -187,7 +187,7 @@ health/backend info — still works from the engine's stored timeline. Generate 
 deterministic day to see the full popover with no sensors:
 
 ```sh
-.venv/bin/python -m dayloop mock --date 2026-07-11
+.venv/bin/python -m scoregoals mock --date 2026-07-11
 ```
 
 Install screenpipe/icalBuddy later and the live sections fill in automatically —

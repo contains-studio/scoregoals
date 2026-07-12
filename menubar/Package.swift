@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "DayloopBar",
+    name: "ScoreGoals",
     platforms: [
         .macOS(.v14)
     ],
     targets: [
         .executableTarget(
-            name: "DayloopBar",
-            path: "Sources/DayloopBar"
+            name: "ScoreGoals",
+            path: "Sources/ScoreGoals"
         )
     ]
 )

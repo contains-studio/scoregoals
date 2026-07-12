@@ -1,6 +1,6 @@
-# dayloop machine-readable CLI schema (`schema_version = 1`)
+# ScoreGoals machine-readable CLI schema (`schema_version = 1`)
 
-This document is the contract between the dayloop Python engine and the macOS
+This document is the contract between the ScoreGoals Python engine and the macOS
 menu bar app. The Swift app decodes against the shapes below, so field names,
 types, and nullability are **stable** — additive changes only; renames/removals
 bump `schema_version`.
@@ -10,19 +10,19 @@ All three commands:
 - Emit **exactly one** JSON object to **stdout** (pretty-printed, UTF-8,
   `ensure_ascii=false` so unicode glyphs like the sparkline are literal).
 - Send diagnostics/warnings to **stderr**, never stdout.
-- Are produced by `dayloop/status.py`, `dayloop/intentions.py`,
-  `dayloop/config.py`.
+- Are produced by `scoregoals/status.py`, `scoregoals/intentions.py`,
+  `scoregoals/config.py`.
 
 Timestamps are ISO-8601 strings with a UTC offset (e.g.
 `"2026-07-11T18:51:04-07:00"`), except a few date-only calendar/session strings
 that may be naive local (`"2026-07-11T18:30:00"`); the app should parse both.
 
 Run the engine from the repo root as:
-`.venv/bin/python -m dayloop <command>`
+`.venv/bin/python -m scoregoals <command>`
 
 ---
 
-## `dayloop status --json`
+## `scoregoals status --json`
 
 One live snapshot. **Never crashes**: every section is guarded; failures append
 a string to `warnings` (and a line to stderr) and fall back to nulls/zeros. The
@@ -151,7 +151,7 @@ scheduled, or the day's events are all in the past). Otherwise:
   },
   "score": { "overall": 75, "on_track": true, "active_minutes": 304.0 },
   "goals": [
-    { "goal_id": "ship-dayloop", "goal_name": "Ship dayloop", "minutes": 131.0, "pct_time": 43.1, "target_pct": 35.0, "on_track": true },
+    { "goal_id": "ship-scoregoals", "goal_name": "Ship scoregoals", "minutes": 131.0, "pct_time": 43.1, "target_pct": 35.0, "on_track": true },
     { "goal_id": "deep-work-coding", "goal_name": "Deep work / coding", "minutes": 0.0, "pct_time": 0.0, "target_pct": 50.0, "on_track": false },
     { "goal_id": "investor-partner-comms", "goal_name": "Investor & partner comms", "minutes": 94.0, "pct_time": 30.9, "target_pct": 20.0, "on_track": true },
     { "goal_id": "learning-research", "goal_name": "Learning & research", "minutes": 47.0, "pct_time": 15.5, "target_pct": 10.0, "on_track": true },
@@ -177,7 +177,7 @@ scheduled, or the day's events are all in the past). Otherwise:
 
 ---
 
-## `dayloop today --json`
+## `scoregoals today --json`
 
 The daily intentions block, enriched with time attributed to each intention
 from today's aligned sessions. Stored at `data/intentions/<date>.json`; the
@@ -226,7 +226,7 @@ Yesterday's UNDONE items are carried over into today's plan (see `carried_from`)
   "items": [
     { "id": "97e0e320", "text": "Finish menu bar app", "goal_id": null, "goal_name": null, "done": true, "attributed_minutes": 0.0, "apps": [], "carried_from": null },
     { "id": "8c4c46a3", "text": "Investor follow-ups", "goal_id": "investor-partner-comms", "goal_name": "Investor & partner comms", "done": false, "attributed_minutes": 94.0, "apps": ["Mail", "zoom.us", "Slack"], "carried_from": "2026-07-10" },
-    { "id": "9a4b3739", "text": "Read screenpipe docs", "goal_id": "ship-dayloop", "goal_name": "Ship dayloop", "done": false, "attributed_minutes": 131.0, "apps": ["Code", "Google Chrome"], "carried_from": null }
+    { "id": "9a4b3739", "text": "Read screenpipe docs", "goal_id": "ship-scoregoals", "goal_name": "Ship scoregoals", "done": false, "attributed_minutes": 131.0, "apps": ["Code", "Google Chrome"], "carried_from": null }
   ],
   "history_summary": { "days": 7, "completion_rate": 0.6 }
 }
@@ -234,7 +234,7 @@ Yesterday's UNDONE items are carried over into today's plan (see `carried_from`)
 
 ---
 
-## `dayloop today history [--days N] [--json]`
+## `scoregoals today history [--days N] [--json]`
 
 Past intentions plus a completion rate, for the last `days` (default 7) ending
 today, **newest day first**. `--json` emits the object below; without it, a
@@ -278,7 +278,7 @@ today (`today clear`) never deletes past days' files, so history is the archive.
 
 ---
 
-## `dayloop focus --json`
+## `scoregoals focus --json`
 
 The single focus-block slot, stored at `data/focus.json`. A block with an
 `until` in the past auto-expires (reads as `active: false`). This is the
@@ -301,8 +301,8 @@ are suppressed.
 ```json
 {
   "active": true,
-  "goal_id": "ship-dayloop",
-  "goal_name": "Ship dayloop",
+  "goal_id": "ship-scoregoals",
+  "goal_name": "Ship scoregoals",
   "started_at": "2026-07-11T18:51:44-07:00",
   "until": "2026-07-11T19:51:44-07:00"
 }
@@ -310,7 +310,7 @@ are suppressed.
 
 ---
 
-## `dayloop config --json`
+## `scoregoals config --json`
 
 The **effective** app-mutable settings — the merge of
 `DEFAULTS < config.toml < data/settings.json < env`. The app writes these via
@@ -327,9 +327,9 @@ which never touches `config.toml`) and reads a single value via
 | `ollama_url` | string | ollama base URL |
 | `gemini_model` | string | gemini model id |
 
-Environment overrides (highest precedence): `DAYLOOP_DEFAULT_BACKEND`,
-`DAYLOOP_NUDGES_ENABLED`, `DAYLOOP_CAPTURE_PAUSED`, `DAYLOOP_REFRESH_SECONDS`,
-`DAYLOOP_OLLAMA_URL`, `DAYLOOP_GEMINI_MODEL`.
+Environment overrides (highest precedence): `SCOREGOALS_DEFAULT_BACKEND`,
+`SCOREGOALS_NUDGES_ENABLED`, `SCOREGOALS_CAPTURE_PAUSED`, `SCOREGOALS_REFRESH_SECONDS`,
+`SCOREGOALS_OLLAMA_URL`, `SCOREGOALS_GEMINI_MODEL`.
 
 ### Example
 
@@ -346,7 +346,7 @@ Environment overrides (highest precedence): `DAYLOOP_DEFAULT_BACKEND`,
 
 ---
 
-## `dayloop goals --json`
+## `scoregoals goals --json`
 
 The `goals.md` editing surface used by the menu bar Goals editor: the file path,
 its verbatim text, and the parsed goals. The Swift app loads `raw` into a
@@ -362,7 +362,7 @@ its verbatim text, and the parsed goals. The Swift app loads `raw` into a
 
 | field | type | notes |
 |------|------|------|
-| `id` | string | slug of the name (`ship-dayloop`), duplicate slugs get `-2`, `-3`, … |
+| `id` | string | slug of the name (`ship-scoregoals`), duplicate slugs get `-2`, `-3`, … |
 | `name` | string | display name from the `## Goal: <name>` heading |
 | `keywords` | array of string | lowercased keywords for session matching |
 | `target_pct` | number \| null | desired % of active time; null when untargeted |
@@ -375,16 +375,16 @@ overwrites `goals.md` (temp file + rename), then prints a one-line summary
 content parses to zero goals it is still written and a warning goes to stderr
 (the file may be mid-draft). `goals archive <goal-id>` / `goals unarchive
 <goal-id>` toggle a goal's `archived:` line in place (atomic write). Bare
-`dayloop goals` pretty-prints the summary (archived goals tagged `[archived]`).
+`scoregoals goals` pretty-prints the summary (archived goals tagged `[archived]`).
 
 ### Example
 
 ```json
 {
-  "path": "/Users/you/projects/dayloop/goals.md",
-  "raw": "## Goal: Ship dayloop\nkeywords: dayloop, screenpipe\ntarget_pct: 35\n…",
+  "path": "/Users/you/projects/scoregoals/goals.md",
+  "raw": "## Goal: Ship scoregoals\nkeywords: scoregoals, screenpipe\ntarget_pct: 35\n…",
   "goals": [
-    { "id": "ship-dayloop", "name": "Ship dayloop", "keywords": ["dayloop", "screenpipe"], "target_pct": 35.0 },
+    { "id": "ship-scoregoals", "name": "Ship scoregoals", "keywords": ["scoregoals", "screenpipe"], "target_pct": 35.0 },
     { "id": "deep-work-coding", "name": "Deep work / coding", "keywords": ["code", "vscode"], "target_pct": 50.0 }
   ]
 }

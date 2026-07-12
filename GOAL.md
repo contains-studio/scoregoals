@@ -1,8 +1,9 @@
-# dayloop — Definition of Done & Test Plan
+# ScoreGoals — Definition of Done & Test Plan
 
 ## What this is
 
-dayloop is a personal, local-first **cybernetic activity tracker** for macOS:
+ScoreGoals ([scoregoals.app](https://scoregoals.app)) is a personal, local-first
+**cybernetic activity tracker** for macOS:
 it captures what actually happened on the Mac (screen OCR / audio / UI text via
 [screenpipe](https://github.com/mediar-ai/screenpipe), plus Calendar, GitHub,
 and Granola), builds a redacted daily timeline, compares that timeline against
@@ -24,12 +25,12 @@ sensor installs + macOS permission grants.
 These exact commands pass today (verified 2026-07-11, venv at `.venv`):
 
 ```sh
-cd ~/projects/dayloop
-.venv/bin/python -m dayloop --help                       # exit 0
-.venv/bin/python -m dayloop doctor                       # 5/7 checks (screenpipe + icalBuddy absent)
-.venv/bin/python -m dayloop mock --date 2026-07-11       # 7 sessions, 304 active min
-.venv/bin/python -m dayloop analyze 2026-07-11 --backend ollama   # real local model call
-.venv/bin/python -m dayloop report  2026-07-11 --backend ollama   # renders data/reports/2026-07-11-eod.md
+cd ~/projects/scoregoals
+.venv/bin/python -m scoregoals --help                       # exit 0
+.venv/bin/python -m scoregoals doctor                       # 5/7 checks (screenpipe + icalBuddy absent)
+.venv/bin/python -m scoregoals mock --date 2026-07-11       # 7 sessions, 304 active min
+.venv/bin/python -m scoregoals analyze 2026-07-11 --backend ollama   # real local model call
+.venv/bin/python -m scoregoals report  2026-07-11 --backend ollama   # renders data/reports/2026-07-11-eod.md
 ```
 
 **Observed local Ollama analyze latency:** ~3.8s cold, ~2.2s warm
@@ -55,24 +56,24 @@ own self-reported score is kept in the report JSON `raw.llm_overall_score`).
 Run these five and eyeball the output:
 
 ```sh
-cd ~/projects/dayloop
+cd ~/projects/scoregoals
 
 # 1. Environment checklist
-.venv/bin/python -m dayloop doctor
+.venv/bin/python -m scoregoals doctor
 #    expect: ollama ✓, gemini ✓ (CLI OAuth), gh ✓, terminal-notifier ✓,
 #            data dirs ✓; screenpipe ✗ + icalBuddy ✗ (not installed yet) -> 5/7
 
 # 2. Write the deterministic mock day
-.venv/bin/python -m dayloop mock --date 2026-07-11
+.venv/bin/python -m scoregoals mock --date 2026-07-11
 #    -> data/timeline/2026-07-11.json  (sessions=7 calendar=3 github=3 meetings=2, 304 active min)
 
 # 3. Analyze with the local model + benchmark it
-.venv/bin/python -m dayloop analyze 2026-07-11 --backend ollama
+.venv/bin/python -m scoregoals analyze 2026-07-11 --backend ollama
 #    -> prints backend/model/latency/cost/score; appends a row to
 #       data/benchmarks/compare.csv; writes data/reports/2026-07-11-eod-ollama.json
 
 # 4. Render the end-of-day report
-.venv/bin/python -m dayloop report 2026-07-11 --backend ollama
+.venv/bin/python -m scoregoals report 2026-07-11 --backend ollama
 #    -> data/reports/2026-07-11-eod.md  (score 75/100)
 
 # 5. Read it
@@ -89,19 +90,19 @@ What to expect (all deterministic for the mock day, 304 active minutes):
 
   | Goal | Minutes | % time | Target | On track |
   |------|--------:|-------:|-------:|:--------:|
-  | Ship dayloop | 131 | 43.1% | 35% | yes |
+  | Ship scoregoals | 131 | 43.1% | 35% | yes |
   | Deep work / coding | 0 | 0.0% | 50% | no |
   | Investor & partner comms | 94 | 30.9% | 20% | yes |
   | Learning & research | 47 | 15.5% | 10% | yes |
   | Unaligned | 32 | 10.5% | — | yes |
 
   (each session maps to at most one goal, so the coding sessions score toward
-  "Ship dayloop" and "Deep work / coding" shows 0 — that is expected)
+  "Ship scoregoals" and "Deep work / coding" shows 0 — that is expected)
 - deterministic day score **75/100** and drift flag
   `No time on 'Deep work / coding' (target 50%)`, both consistent with the
   table above and identical whichever backend runs
 - graceful degradation (verified): with Ollama down
-  (`DAYLOOP_OLLAMA_URL=http://localhost:9 ... report ... --backend ollama`) the
+  (`SCOREGOALS_OLLAMA_URL=http://localhost:9 ... report ... --backend ollama`) the
   report still renders from the deterministic summary and exits 0 — it never
   crashes the pipeline
 
@@ -118,33 +119,33 @@ What to expect (all deterministic for the mock day, 304 active minutes):
    the Gemini **OAuth CLI** path is used automatically (works today, tokens
    estimated, `raw.metered=false`).
 4. *(optional)* Pull a larger / vision-capable Ollama model and point at it via
-   `DAYLOOP_OLLAMA_MODEL=…` or `config.toml` (the default 4B thinking model is
+   `SCOREGOALS_OLLAMA_MODEL=…` or `config.toml` (the default 4B thinking model is
    text-only and already installed).
 5. **Load the schedule:** `chmod +x scripts/install.sh && scripts/install.sh`
-   — creates the venv, installs the `dayloop` console script, and loads the
+   — creates the venv, installs the `scoregoals` console script, and loads the
    four launchd user agents. (`scripts/install.sh uninstall` removes them.)
 6. Work a normal morning, then run it live:
 
    ```sh
-   dayloop capture $(date +%F)                     # build today's timeline from live sensors
-   dayloop analyze $(date +%F) --backend both      # Gemini vs Ollama, benchmarked
-   dayloop report  $(date +%F) --backend ollama    # end-of-day markdown
-   dayloop plan                                     # morning plan + notification
-   dayloop nudge                                    # drift check (notifies only if drifting)
+   scoregoals capture $(date +%F)                     # build today's timeline from live sensors
+   scoregoals analyze $(date +%F) --backend both      # Gemini vs Ollama, benchmarked
+   scoregoals report  $(date +%F) --backend ollama    # end-of-day markdown
+   scoregoals plan                                     # morning plan + notification
+   scoregoals nudge                                    # drift check (notifies only if drifting)
    ```
 
 Launchd schedule installed by `scripts/install.sh` (rendered from
-`dayloop/launchd/*.plist`):
+`scoregoals/launchd/*.plist`):
 
 | agent               | when          | runs                                              |
 |---------------------|---------------|---------------------------------------------------|
-| com.dayloop.morning | 07:30 daily   | `dayloop plan`                                    |
-| com.dayloop.nudge   | every 20 min  | `dayloop nudge`                                   |
-| com.dayloop.eod     | 21:00 daily   | `dayloop capture <today> && report <today> --backend ollama` |
-| com.dayloop.weekly  | Sun 20:00     | `dayloop weekly`                                  |
+| com.scoregoals.morning | 07:30 daily   | `scoregoals plan`                                    |
+| com.scoregoals.nudge   | every 20 min  | `scoregoals nudge`                                   |
+| com.scoregoals.eod     | 21:00 daily   | `scoregoals capture <today> && report <today> --backend ollama` |
+| com.scoregoals.weekly  | Sun 20:00     | `scoregoals weekly`                                  |
 
-Logs land in `~/Library/Logs/dayloop/`; verify with
-`launchctl list | grep com.dayloop`.
+Logs land in `~/Library/Logs/scoregoals/`; verify with
+`launchctl list | grep com.scoregoals`.
 
 Live acceptance criteria:
 
@@ -158,7 +159,7 @@ Live acceptance criteria:
 ## How to compare Gemini vs Ollama
 
 ```sh
-dayloop analyze 2026-07-11 --backend both
+scoregoals analyze 2026-07-11 --backend both
 ```
 
 Then read the three signals side by side:
@@ -181,7 +182,7 @@ egress + a fraction of a cent.
 Done (works now, verified 2026-07-11):
 
 - [x] Package imports on bare system python 3.14 (no third-party deps)
-- [x] `python3 -m dayloop --help` / `doctor` / `mock` all work
+- [x] `python3 -m scoregoals --help` / `doctor` / `mock` all work
 - [x] sources: screenpipe / calendar / github / granola — each degrades to
       `[]` + one-line warning when its tool/key is absent
 - [x] aggregate: segment (sessionize + categorize), redact (keys/JWTs/cards/

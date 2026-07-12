@@ -1,5 +1,5 @@
 #!/bin/sh
-# dayloop installer — idempotent setup for the local venv + launchd user agents.
+# scoregoals installer — idempotent setup for the local venv + launchd user agents.
 #
 # Usage:
 #   scripts/install.sh            # create venv, render + load launchd agents
@@ -15,28 +15,32 @@ set -eu
 # --- Resolve paths -----------------------------------------------------------
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
-PLIST_SRC_DIR="$REPO_DIR/dayloop/launchd"
+PLIST_SRC_DIR="$REPO_DIR/scoregoals/launchd"
 
 VENV_DIR="$REPO_DIR/.venv"
-DAYLOOP_BIN="$VENV_DIR/bin/dayloop"
-DAYLOOP_BINDIR="$VENV_DIR/bin"
+SCOREGOALS_BIN="$VENV_DIR/bin/scoregoals"
+SCOREGOALS_BINDIR="$VENV_DIR/bin"
 
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-LOG_DIR="$HOME/Library/Logs/dayloop"
+LOG_DIR="$HOME/Library/Logs/scoregoals"
 
 # uv location per this machine (falls back to PATH lookup).
 UV_BIN="$HOME/.local/bin/uv"
 [ -x "$UV_BIN" ] || UV_BIN="uv"
 
-AGENTS="com.dayloop.morning com.dayloop.eod com.dayloop.weekly com.dayloop.nudge"
+AGENTS="com.scoregoals.morning com.scoregoals.eod com.scoregoals.weekly com.scoregoals.nudge"
+
+# Legacy pre-rebrand labels — cleaned up on uninstall so anyone who loaded the
+# old com.dayloop.* agents ends up with a clean slate after the rename.
+LEGACY_AGENTS="com.dayloop.morning com.dayloop.eod com.dayloop.weekly com.dayloop.nudge"
 
 # GUI domain for launchctl bootstrap/bootout (per-user Aqua session).
 GUI_DOMAIN="gui/$(id -u)"
 
 # --- Uninstall path ----------------------------------------------------------
 uninstall() {
-    echo "==> Uninstalling dayloop launchd agents"
-    for label in $AGENTS; do
+    echo "==> Uninstalling scoregoals launchd agents (incl. legacy com.dayloop.*)"
+    for label in $AGENTS $LEGACY_AGENTS; do
         plist="$LAUNCH_AGENTS_DIR/$label.plist"
         # bootout (modern) then fall back to legacy unload; ignore errors.
         launchctl bootout "$GUI_DOMAIN/$label" 2>/dev/null || true
@@ -57,11 +61,11 @@ fi
 # --- 1. Python venv via uv ---------------------------------------------------
 echo "==> Creating venv with uv at $VENV_DIR"
 "$UV_BIN" venv "$VENV_DIR" --python 3.14
-echo "==> Installing dayloop (editable) into the venv"
+echo "==> Installing scoregoals (editable) into the venv"
 VIRTUAL_ENV="$VENV_DIR" "$UV_BIN" pip install -e "$REPO_DIR"
 
-if [ ! -x "$DAYLOOP_BIN" ]; then
-    echo "ERROR: expected console script not found at $DAYLOOP_BIN" >&2
+if [ ! -x "$SCOREGOALS_BIN" ]; then
+    echo "ERROR: expected console script not found at $SCOREGOALS_BIN" >&2
     exit 1
 fi
 
@@ -84,9 +88,9 @@ for label in $AGENTS; do
     fi
 
     sed \
-        -e "s|__DAYLOOP_BIN__|$DAYLOOP_BIN|g" \
-        -e "s|__DAYLOOP_BINDIR__|$DAYLOOP_BINDIR|g" \
-        -e "s|__DAYLOOP_REPO__|$REPO_DIR|g" \
+        -e "s|__SCOREGOALS_BIN__|$SCOREGOALS_BIN|g" \
+        -e "s|__SCOREGOALS_BINDIR__|$SCOREGOALS_BINDIR|g" \
+        -e "s|__SCOREGOALS_REPO__|$REPO_DIR|g" \
         -e "s|__HOME__|$HOME|g" \
         "$src" > "$dst"
 
@@ -104,19 +108,19 @@ done
 
 # --- Done --------------------------------------------------------------------
 echo ""
-echo "==> dayloop installed."
+echo "==> scoregoals installed."
 echo "    venv:    $VENV_DIR"
-echo "    binary:  $DAYLOOP_BIN"
-echo "    agents:  $LAUNCH_AGENTS_DIR/com.dayloop.*.plist"
+echo "    binary:  $SCOREGOALS_BIN"
+echo "    agents:  $LAUNCH_AGENTS_DIR/com.scoregoals.*.plist"
 echo "    logs:    $LOG_DIR"
 echo ""
 echo "    Schedules:"
-echo "      morning  com.dayloop.morning  07:30 daily   -> dayloop plan"
-echo "      eod      com.dayloop.eod      21:00 daily   -> dayloop capture <today> && report <today> --backend ollama"
-echo "      weekly   com.dayloop.weekly   Sun 20:00     -> dayloop weekly"
-echo "      nudge    com.dayloop.nudge    every 20 min  -> dayloop nudge"
+echo "      morning  com.scoregoals.morning  07:30 daily   -> scoregoals plan"
+echo "      eod      com.scoregoals.eod      21:00 daily   -> scoregoals capture <today> && report <today> --backend ollama"
+echo "      weekly   com.scoregoals.weekly   Sun 20:00     -> scoregoals weekly"
+echo "      nudge    com.scoregoals.nudge    every 20 min  -> scoregoals nudge"
 echo ""
-echo "    Verify:     launchctl list | grep com.dayloop"
+echo "    Verify:     launchctl list | grep com.scoregoals"
 echo "    Uninstall:  scripts/install.sh uninstall"
 echo ""
 echo "Next: install screenpipe and grant permissions (see GOAL.md)."

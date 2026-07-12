@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# dayloop setup — the ONE command a colleague runs after cloning.
+# scoregoals setup — the ONE command a colleague runs after cloning.
 #
 #   ./scripts/setup.sh                       # interactive, idempotent
 #   ./scripts/setup.sh --non-interactive     # take all defaults, no prompts
@@ -9,12 +9,12 @@
 #
 # What it does (all steps are safe to re-run):
 #   1. Check prerequisites (python3 >=3.12, git; swift is optional).
-#   2. Create the .venv and install dayloop (editable) — prefers uv.
+#   2. Create the .venv and install scoregoals (editable) — prefers uv.
 #   3. Optionally record your Gemini API key + projects dir (per-user, in
 #      data/settings.json — never in git).
 #   4. Write a starter goals.md IF you don't already have one.
 #   5. Build the menu bar app if the swift toolchain is present.
-#   6. Run `dayloop doctor` and print next steps.
+#   6. Run `scoregoals doctor` and print next steps.
 #
 # It never edits config.toml or overwrites an existing goals.md / settings.
 
@@ -50,7 +50,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-echo "==> dayloop setup  (repo: $REPO_DIR)"
+echo "==> scoregoals setup  (repo: $REPO_DIR)"
 
 # --- 1. Prerequisites --------------------------------------------------------
 echo "==> Checking prerequisites"
@@ -95,7 +95,7 @@ else
     fi
 fi
 
-echo "==> Installing dayloop (editable)"
+echo "==> Installing scoregoals (editable)"
 if [ "$HAVE_UV" -eq 1 ]; then
     VIRTUAL_ENV="$VENV_DIR" uv pip install -e "$REPO_DIR"
 else
@@ -109,7 +109,7 @@ if [ ! -x "$PY" ]; then
 fi
 
 # --- 3. Per-user settings (Gemini BYOK + projects dir) -----------------------
-# All writes go to data/settings.json via `dayloop config set` (gitignored),
+# All writes go to data/settings.json via `scoregoals config set` (gitignored),
 # never to config.toml. The Gemini key is never echoed.
 
 # a. Gemini API key
@@ -120,7 +120,7 @@ if [ "$GEMINI_KEY_SET" -eq 0 ] && [ "$NON_INTERACTIVE" -eq 0 ]; then
     GEMINI_KEY_SET=1
 fi
 if [ "$GEMINI_KEY_SET" -eq 1 ] && [ -n "$GEMINI_KEY" ]; then
-    "$PY" -m dayloop config set gemini_api_key "$GEMINI_KEY" >/dev/null
+    "$PY" -m scoregoals config set gemini_api_key "$GEMINI_KEY" >/dev/null
     echo "==> Gemini API key stored (data/settings.json, gitignored)"
     unset GEMINI_KEY
 else
@@ -138,7 +138,7 @@ if [ "$PROJECTS_DIR_SET" -eq 1 ]; then
     [ -n "$PROJECTS_DIR" ] || PROJECTS_DIR="$HOME/projects"
     # Expand a leading ~ to $HOME.
     case "$PROJECTS_DIR" in "~"/*) PROJECTS_DIR="$HOME/${PROJECTS_DIR#~/}" ;; "~") PROJECTS_DIR="$HOME" ;; esac
-    "$PY" -m dayloop config set projects_dir "$PROJECTS_DIR" >/dev/null
+    "$PY" -m scoregoals config set projects_dir "$PROJECTS_DIR" >/dev/null
     echo "==> projects_dir = $PROJECTS_DIR"
 fi
 
@@ -150,7 +150,7 @@ else
     echo "==> Writing a starter goals.md"
     cat > "$GOALS_FILE" <<'GOALS'
 <!--
-dayloop goals file — parsed by dayloop/compare/align.py (load_goals).
+scoregoals goals file — parsed by scoregoals/compare/align.py (load_goals).
 
 Format, one goal per section:
 
@@ -190,26 +190,26 @@ fi
 
 # --- 6. Doctor + next steps --------------------------------------------------
 echo ""
-echo "==> Running dayloop doctor"
-"$PY" -m dayloop doctor || true
+echo "==> Running scoregoals doctor"
+"$PY" -m scoregoals doctor || true
 
 echo ""
 echo "======================================================================"
-echo " dayloop setup complete."
+echo " scoregoals setup complete."
 echo ""
 echo " Next steps:"
 echo "   1. Install the screenpipe desktop app (external, free for personal"
 echo "      use):  https://screenpi.pe  — then grant Screen Recording +"
-echo "      Microphone. dayloop detects it at http://localhost:3030."
+echo "      Microphone. scoregoals detects it at http://localhost:3030."
 echo "   2. (optional) Schedule the daily/weekly jobs:  scripts/install.sh"
 if [ "$HAVE_SWIFT" -eq 1 ]; then
-echo "   3. Open the menu bar app:  open menubar/DayloopBar.app"
+echo "   3. Open the menu bar app:  open menubar/ScoreGoals.app"
 fi
 echo ""
 echo " Try it now (no screenpipe needed):"
-echo "   .venv/bin/python -m dayloop mock --date 2026-07-11"
-echo "   .venv/bin/python -m dayloop analyze 2026-07-11 --backend ollama"
+echo "   .venv/bin/python -m scoregoals mock --date 2026-07-11"
+echo "   .venv/bin/python -m scoregoals analyze 2026-07-11 --backend ollama"
 echo ""
 echo " Change the Gemini key later:"
-echo "   .venv/bin/python -m dayloop config set gemini_api_key <key>   # '' clears"
+echo "   .venv/bin/python -m scoregoals config set gemini_api_key <key>   # '' clears"
 echo "======================================================================"

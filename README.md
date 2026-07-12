@@ -1,6 +1,7 @@
-# dayloop
+# ScoreGoals
 
-A personal, local-first **cybernetic activity tracker** for macOS. It watches
+[scoregoals.app](https://scoregoals.app) — a personal, local-first **cybernetic
+activity tracker** for macOS. It watches
 what actually happens on the Mac (screen OCR, accessibility text, meeting
 audio via [screenpipe](https://github.com/mediar-ai/screenpipe), plus
 Calendar, GitHub, and Granola), builds a daily timeline, compares it against
@@ -17,7 +18,7 @@ Everything stays on-device except what you explicitly send to Gemini.
 ```
       ┌───────────────────────── SENSORS ─────────────────────────┐
       │ screenpipe (OCR · audio · UI)   Calendar   GitHub  Granola │
-      │              dayloop/sources/*.fetch()                     │
+      │              scoregoals/sources/*.fetch()                     │
       └───────────────────────────┬────────────────────────────────┘
                                   ▼
       ┌──────────────────────── ESTIMATOR ────────────────────────┐
@@ -44,28 +45,28 @@ One command sets up the venv, installs the engine, and (optionally) builds the
 menu bar app. See [SETUP.md](SETUP.md) for the full colleague-facing guide.
 
 ```sh
-git clone <this-repo> ~/projects/dayloop
-cd ~/projects/dayloop
+git clone <this-repo> ~/projects/scoregoals
+cd ~/projects/scoregoals
 ./scripts/setup.sh                           # venv + install + prompts, idempotent
 ```
 
 Then, from the repo (works today, no screenpipe needed — uses the mock day):
 
 ```sh
-.venv/bin/python -m dayloop doctor                    # environment checklist
-.venv/bin/python -m dayloop mock --date 2026-07-11    # deterministic test timeline
-.venv/bin/python -m dayloop analyze 2026-07-11 --backend ollama   # local model + benchmark row
-.venv/bin/python -m dayloop report  2026-07-11 --backend ollama   # -> data/reports/2026-07-11-eod.md
+.venv/bin/python -m scoregoals doctor                    # environment checklist
+.venv/bin/python -m scoregoals mock --date 2026-07-11    # deterministic test timeline
+.venv/bin/python -m scoregoals analyze 2026-07-11 --backend ollama   # local model + benchmark row
+.venv/bin/python -m scoregoals report  2026-07-11 --backend ollama   # -> data/reports/2026-07-11-eod.md
 ```
 
 For live capture, install the screenpipe desktop app (external dependency) from
 <https://screenpi.pe> and grant Screen Recording + Microphone. Gemini is
 bring-your-own-key (optional); set it during setup or later with
-`.venv/bin/python -m dayloop config set gemini_api_key <key>`.
+`.venv/bin/python -m scoregoals config set gemini_api_key <key>`.
 
 All commands: `capture`, `analyze`, `report`, `plan`, `nudge`, `weekly`,
 `mock`, `status`, `today`, `focus`, `config`, `doctor` — see
-`python3 -m dayloop --help`. The `status`/`today`/`focus`/`config` commands are
+`python3 -m scoregoals --help`. The `status`/`today`/`focus`/`config` commands are
 the machine-readable surface the menu bar app drives; their JSON is documented
 in `docs/STATUS_SCHEMA.md`.
 
@@ -76,11 +77,11 @@ By default the Ollama backend runs **locally on this machine**
 enough to serve the model with no extra setup, so that's the default.
 
 It's a single config value, so you can offload inference to another box (e.g. a
-Mac Studio) over **Tailscale** without touching any code — point dayloop at the
+Mac Studio) over **Tailscale** without touching any code — point scoregoals at the
 remote host's tailnet address:
 
 ```sh
-export DAYLOOP_OLLAMA_URL=http://mac-studio.<tailnet>.ts.net:11434
+export SCOREGOALS_OLLAMA_URL=http://mac-studio.<tailnet>.ts.net:11434
 # or set ollama_url in config.toml
 ```
 
@@ -99,11 +100,11 @@ only the model call is redirected.
 A native macOS menu bar app lives in [`menubar/`](menubar/). It puts today's
 alignment score in your menu bar and shows a live popover (score, current
 activity, per-goal time breakdown, weekly sparkline, health) by polling
-`dayloop status --json`. It's a read-only viewer over the engine.
+`scoregoals status --json`. It's a read-only viewer over the engine.
 
 ```sh
-bash menubar/build.sh          # -> menubar/DayloopBar.app (ad-hoc signed)
-open menubar/DayloopBar.app    # first launch: right-click -> Open
+bash menubar/build.sh          # -> menubar/ScoreGoals.app (ad-hoc signed)
+open menubar/ScoreGoals.app    # first launch: right-click -> Open
 ```
 
 See [`menubar/README.md`](menubar/README.md) for how it finds the engine,
@@ -112,11 +113,11 @@ absent (mock still works).
 
 ## Layout
 
-- `dayloop/models.py` — frozen data contracts (ActivityRecord, Session,
+- `scoregoals/models.py` — frozen data contracts (ActivityRecord, Session,
   DayTimeline, Goal, GoalAlignment, Report)
-- `dayloop/sources/` — sensors, `dayloop/aggregate/` — estimator,
-  `dayloop/compare/` + `dayloop/analyze/` — comparator,
-  `dayloop/feedback/` — actuators
+- `scoregoals/sources/` — sensors, `scoregoals/aggregate/` — estimator,
+  `scoregoals/compare/` + `scoregoals/analyze/` — comparator,
+  `scoregoals/feedback/` — actuators
 - `config.toml` — defaults that work out of the box; `goals.md` — your goals
 - `data/` — sqlite + JSON timelines/reports/benchmarks (gitignored)
 

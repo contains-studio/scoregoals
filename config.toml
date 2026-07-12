@@ -1,5 +1,5 @@
-# dayloop configuration — safe defaults; the app runs with this file untouched.
-# All keys optional; missing keys fall back to the same defaults in dayloop/config.py.
+# scoregoals configuration — safe defaults; the app runs with this file untouched.
+# All keys optional; missing keys fall back to the same defaults in scoregoals/config.py.
 # NEVER put GEMINI_API_KEY in this file — it is read from the environment only.
 
 data_dir = "./data"                       # relative paths resolve against this file's directory
@@ -20,4 +20,4 @@ gemini_price_out_per_1m = 2.50
                                           # setup.sh writes your choice into data/settings.json.
 github_user = ""                          # empty = auto-detect from `gh` (gh api user --jq .login)
 nudge_threshold_min = 20                  # minutes of off-goal drift before a nudge fires
-icloud_mirror = ""                        # e.g. "~/Library/Mobile Documents/com~apple~CloudDocs/dayloop"; empty = off
+icloud_mirror = ""                        # e.g. "~/Library/Mobile Documents/com~apple~CloudDocs/scoregoals"; empty = off

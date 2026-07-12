@@ -40,7 +40,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>LSUIElement</key>               <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Screenpipe Recorder transcribes meetings and audio locally for your dayloop timeline.</string>
+    <string>Screenpipe Recorder transcribes meetings and audio locally for your ScoreGoals timeline.</string>
 </dict>
 </plist>
 PLIST

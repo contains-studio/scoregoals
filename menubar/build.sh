@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Build DayloopBar.app from the SwiftPM executable.
+# Build ScoreGoals.app from the SwiftPM executable.
 #
-#   1. swift build -c release            -> .build/release/DayloopBar
-#   2. assemble DayloopBar.app bundle    (Contents/MacOS + Info.plist)
+#   1. swift build -c release            -> .build/release/ScoreGoals
+#   2. assemble ScoreGoals.app bundle    (Contents/MacOS + Info.plist)
 #   3. ad-hoc codesign                   (codesign -s -)
 #   4. print how to run it
 #
@@ -15,8 +15,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-APP_NAME="DayloopBar"
-BUNDLE_ID="com.dayloop.menubar"
+APP_NAME="ScoreGoals"
+BUNDLE_ID="com.scoregoals.menubar"
 VERSION="0.1.0"
 CONFIG="release"
 
@@ -50,7 +50,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>            <string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key>     <string>Dayloop</string>
+    <key>CFBundleDisplayName</key>     <string>ScoreGoals</string>
     <key>CFBundleExecutable</key>      <string>${APP_NAME}</string>
     <key>CFBundleIdentifier</key>      <string>${BUNDLE_ID}</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
@@ -83,7 +83,7 @@ echo " Or run the binary directly (logs to stderr):"
 echo "   \"${MACOS_DIR}/${APP_NAME}\""
 echo
 echo " Debug (log every engine call to a file):"
-echo "   DAYLOOP_BAR_DEBUG=/tmp/dayloopbar.log \"${MACOS_DIR}/${APP_NAME}\""
+echo "   SCOREGOALS_BAR_DEBUG=/tmp/scoregoalsbar.log \"${MACOS_DIR}/${APP_NAME}\""
 echo
 echo " Look for the gauge + score in your menu bar (top-right)."
 echo "======================================================================"
