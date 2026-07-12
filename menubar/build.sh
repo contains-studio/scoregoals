@@ -44,6 +44,16 @@ rm -rf "${APP_DIR}"
 mkdir -p "${MACOS_DIR}" "${RES_DIR}"
 cp "${BIN_PATH}" "${MACOS_DIR}/${APP_NAME}"
 
+# App icon: copied from the repo (menubar/Resources/ScoreGoals.icns) so builds are
+# reproducible. Info.plist below points CFBundleIconFile at it.
+ICON_SRC="${SCRIPT_DIR}/Resources/${APP_NAME}.icns"
+if [[ -f "${ICON_SRC}" ]]; then
+  cp "${ICON_SRC}" "${RES_DIR}/${APP_NAME}.icns"
+  echo "==> bundled icon: ${RES_DIR}/${APP_NAME}.icns"
+else
+  echo "!! icon not found at ${ICON_SRC} — building without an app icon" >&2
+fi
+
 cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -52,6 +62,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key>            <string>${APP_NAME}</string>
     <key>CFBundleDisplayName</key>     <string>ScoreGoals</string>
     <key>CFBundleExecutable</key>      <string>${APP_NAME}</string>
+    <key>CFBundleIconFile</key>        <string>${APP_NAME}</string>
     <key>CFBundleIdentifier</key>      <string>${BUNDLE_ID}</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleShortVersionString</key> <string>${VERSION}</string>

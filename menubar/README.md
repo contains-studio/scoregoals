@@ -15,6 +15,9 @@ glyph and color reflect state:
 
 - green gauge — on track
 - amber gauge — drifting (score present but below target)
+- grey gauge, **no number** — insufficient captured data (< 30 active min): the
+  day is honestly *unscored* rather than shown as a fake 0. The item's tooltip
+  reads "not enough captured time yet (Nm)".
 - red triangle — engine unavailable / no data
 - greyed gauge — first fetch in flight
 
@@ -25,7 +28,12 @@ engine is erroring, so a frozen number never looks live.
 
 1. **Header** — big score `NN / 100`, an "on track / drifting / engine
    unavailable" line, the date, and a **gear menu** (Settings…, Refresh now,
-   Quit ScoreGoals).
+   Quit ScoreGoals). On an unscored day (< 30 active min) the number becomes `—`
+   and the line reads "not enough captured time yet (Nm)". **Click the score** to
+   toggle a **score breakdown**: the day's sessions grouped per goal (plus
+   Off-track / Not work / Unmatched), each group showing its total minutes and
+   the read-only sessions behind it (span · app · minutes) — sourced from
+   `review --json`, no new engine surface.
 2. **NOW** — what you're doing right now (current app → mapped goal) with an
    on-task/off-task dot. With no live sensor it shows "no sensor / screenpipe not
    reachable"; it lights up once screenpipe is present.
@@ -38,20 +46,30 @@ engine is erroring, so a frozen number never looks live.
    --json`; a ↩ flags days that had carried-over items). When no intentions are
    set yet, an inline three-field editor appears with a **Set today's 3** button
    (→ `today set "a|b|c"`).
-4. **FOCUS** — if a block is active, the focus goal + remaining time + a **Stop**
+4. **REVIEW** — the sessions the engine is least sure about (a keyword guess or
+   unmatched), biggest minutes first, with a count badge. Each row shows minutes ·
+   app · title (truncated in the middle) and **one-gesture controls**: a **goal
+   picker** (menu of your active goals), **Off-track**, **Not work**, and a **✓**
+   that confirms the current assignment. Each button calls `label <id> …`, flashes
+   the returned score delta inline on the row (e.g. `66 → 71`), then refreshes. At
+   most 6 rows show, with an "**N more…**" expander, plus **Confirm all** for the
+   remainder that already have an assignment. When nothing needs review the whole
+   section collapses to a single "**All reviewed ✓**" line. (Source: `review
+   --json`; the same call feeds the header's score breakdown.)
+5. **FOCUS** — if a block is active, the focus goal + remaining time + a **Stop**
    button (→ `focus stop`). Otherwise a **Start focus block** menu of your current
    goals with a minutes stepper (10–120, default 50) (→ `focus start <goal-id>
    --minutes N`).
-5. **TIME ON GOAL** — each goal with its share of time today and its target
+6. **TIME ON GOAL** — each goal with its share of time today and its target
    (`43% / 35%`), a green/amber progress bar vs target, plus a 7-day bar chart of
    scores, the on-track-days streak (`N/7`), and the **next calendar event** with
    a countdown when one is scheduled. A small **pencil** next to the header opens
    Settings' Goals editor.
-6. **QUICK ACTIONS** — **Capture** (`capture <today>`), **EOD** (`report <today>
+7. **QUICK ACTIONS** — **Capture** (`capture <today>`), **EOD** (`report <today>
    --backend …`, then reveals `data/reports/<today>-eod.md` in Finder), **Plan**
    (`plan`), and **Refresh**. Each shows a spinner while running and the result
    (success or error) appears inline; the UI never blocks.
-7. **Footer** — health chips (screenpipe, backend/ollama), last-capture time, and
+8. **Footer** — health chips (screenpipe, backend/ollama), last-capture time, and
    any engine error.
 
 ## How each control maps to the engine
@@ -61,6 +79,10 @@ engine is erroring, so a frozen number never looks live.
 | Intention checkbox                 | `today toggle <id>`                          |
 | "Set today's 3" editor             | `today set "a\|b\|c"`                         |
 | History disclosure                 | `today history --days 7 --json`              |
+| Review: goal picker                | `label <id> --goal <goal-id>`                |
+| Review: Off-track / Not work / ✓   | `label <id> --off-track\|--not-work\|--confirm` |
+| Review: Confirm all                | `label <id> --confirm` per pending assigned session |
+| Header score tap (breakdown)       | `review --json` (read-only)                  |
 | Start focus block (goal menu)      | `focus start <goal-id> --minutes <N>`        |
 | Stop (focus)                       | `focus stop`                                 |
 | Capture now                        | `capture <today>`                            |
@@ -72,8 +94,10 @@ engine is erroring, so a frozen number never looks live.
 | Settings: Save goals               | `goals write` (new markdown piped on **stdin**) |
 | Settings: Archive / Unarchive goal | `goals archive\|unarchive <goal-id>`         |
 
-Reads are `status --json` (every poll), `config --json` (on launch + when Settings
-opens), and `goals --json` (when the Goals editor loads). `report`'s backend is
+Reads are `status --json` (every poll), `review --json` (every poll + after each
+label, feeding both the Review pane and the header score breakdown), `config
+--json` (on launch + when Settings opens), and `goals --json` (when the Goals
+editor loads). `report`'s backend is
 derived from `status.health.backend.default` (`both` maps to `ollama`, since
 `report --backend` accepts only `ollama`/`gemini`).
 
@@ -103,6 +127,11 @@ Open **Settings…** from the gear menu. It loads current values from
   one-click **Archive / Unarchive** button per goal (→ `goals archive|unarchive
   <goal-id>`) — archived goals stay in the file but drop out of alignment,
   targets, and drift. The raw editor remains the power path.
+- **Learning** — a read-only KPI line from `status.learning`: the number of
+  **learned rules** and the weekly **corrections/wk trend** (first → latest, e.g.
+  `12 → 3`), plus this week's correction count. As you confirm the engine's
+  guesses in the Review pane it promotes deterministic rules and this trend falls
+  toward zero. Renders calmly (`—`) before any corrections exist.
 - **Engine location** — a repo directory or engine binary, persisted in
   UserDefaults (key `scoregoalsEnginePath`) and used by `ScoreGoalsClient` so
   `$SCOREGOALS_BIN` is no longer the only override. "Apply path" rebuilds the engine
@@ -126,9 +155,10 @@ bash menubar/build.sh
 ```
 
 This runs `swift build -c release`, assembles `menubar/ScoreGoals.app`
-(Contents/MacOS + Info.plist with `LSUIElement=1` so there's no Dock icon), and
-**ad-hoc code-signs** it (`codesign --sign -`). Output:
-`menubar/ScoreGoals.app`. Requires only the Swift toolchain (macOS 14+).
+(Contents/MacOS + Info.plist with `LSUIElement=1` so there's no Dock icon), copies
+the committed app icon `menubar/Resources/ScoreGoals.icns` into the bundle (wired
+via `CFBundleIconFile`), and **ad-hoc code-signs** it (`codesign --sign -`).
+Output: `menubar/ScoreGoals.app`. Requires only the Swift toolchain (macOS 14+).
 
 ## Run
 

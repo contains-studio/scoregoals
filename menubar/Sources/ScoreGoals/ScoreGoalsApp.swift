@@ -53,19 +53,36 @@ struct MenuBarLabel: View {
         switch store.barState {
         case .onTrack:  return "gauge.with.dots.needle.67percent"
         case .drifting: return "gauge.with.dots.needle.33percent"
+        case .unscored: return "gauge.with.dots.needle.0percent"   // grey, no number
         case .off:      return "exclamationmark.triangle.fill"
         case .loading:  return "gauge.with.dots.needle.0percent"
         }
     }
 
+    /// Tooltip on the status item: the score, or the honest insufficient-data note.
+    private var help: String {
+        guard let s = store.status else { return "ScoreGoals — loading…" }
+        if !s.score.scored {
+            return "ScoreGoals — not enough captured time yet (\(Int(s.score.activeMinutes))m)"
+        }
+        if let overall = s.score.overall {
+            return "ScoreGoals — score \(overall)/100"
+        }
+        return "ScoreGoals"
+    }
+
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: symbol)
-            Text(store.scoreText)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .monospacedDigit()
+            // Empty on an unscored day: a bare grey gauge, no number.
+            if !store.scoreText.isEmpty {
+                Text(store.scoreText)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
         }
         .foregroundStyle(store.barState.tint)
         .opacity(store.isStale ? 0.45 : 1.0)
+        .help(help)
     }
 }

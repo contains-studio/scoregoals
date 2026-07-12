@@ -7,6 +7,7 @@ import AppKit
 enum BarState {
     case onTrack      // score present, on_track == true      -> green
     case drifting     // score present, on_track == false     -> amber
+    case unscored     // insufficient captured data (< 30m)   -> grey, no number
     case off          // engine error / no data               -> red
     case loading      // first fetch in flight                -> greyed
 
@@ -14,6 +15,7 @@ enum BarState {
         switch self {
         case .onTrack:  return .green
         case .drifting: return .orange
+        case .unscored: return .secondary
         case .off:      return .red
         case .loading:  return .secondary
         }
@@ -55,6 +57,18 @@ final class StatusStore: ObservableObject {
     /// Intentions history (`today history --json`), loaded on demand by the
     /// popover's History disclosure. Nil until first loaded.
     @Published private(set) var history: IntentionsHistory? = nil
+    /// The full `review --json` payload — every session resolved to a verdict.
+    /// Drives the Review pane and the score-evidence breakdown. Nil until first
+    /// loaded; refreshed alongside status and after every label write.
+    @Published private(set) var review: ReviewResponse? = nil
+    /// A non-fatal error from the last `review --json` call (nil on success).
+    @Published private(set) var reviewError: String? = nil
+    /// True only during the very first review load (so we show a spinner once,
+    /// not on every silent background refresh).
+    @Published private(set) var reviewLoading: Bool = false
+    /// Per-session score-delta flash (e.g. "66 → 71"), keyed by session id, shown
+    /// briefly inline on a row after its label lands, then auto-cleared.
+    @Published var reviewFlash: [String: String] = [:]
     /// Keys of write actions currently in flight (e.g. "today", "focus", "capture").
     @Published private(set) var busyActions: Set<String> = []
     /// The last write action's result, shown inline; auto-clears on the next action.
@@ -96,6 +110,7 @@ final class StatusStore: ObservableObject {
     func start() {
         guard timer == nil else { return }   // idempotent: safe from multiple onAppear
         refresh()
+        loadReview()
         loadConfig()
         scheduleTimer()
     }
@@ -108,7 +123,10 @@ final class StatusStore: ObservableObject {
     private func scheduleTimer() {
         timer?.invalidate()
         let t = Timer(timeInterval: refreshSeconds, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            Task { @MainActor in
+                self?.refresh()
+                self?.loadReview()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -160,6 +178,101 @@ final class StatusStore: ObservableObject {
                 self.applyRefreshCadence(TimeInterval(cfg.refreshSeconds))
             }
         }
+    }
+
+    // MARK: - Review (review --json + label)
+
+    /// Reload `review --json`. Shows a spinner only on the first load; subsequent
+    /// silent background refreshes keep the last good payload visible while
+    /// fetching. Never crashes — a failure sets `reviewError` and leaves the last
+    /// good `review` in place.
+    func loadReview() {
+        if review == nil { reviewLoading = true }
+        Task {
+            let result = await client.runAsync(["review", "--json"], timeout: 8)
+            self.reviewLoading = false
+            switch result {
+            case .success(let text):
+                if let data = text.data(using: .utf8),
+                   let payload = try? JSONDecoder().decode(ReviewResponse.self, from: data) {
+                    self.review = payload
+                    self.reviewError = nil
+                } else {
+                    self.reviewError = "couldn't decode review JSON"
+                }
+            case .failure(let err):
+                self.reviewError = err.description
+            }
+        }
+    }
+
+    /// Apply one correction to a session via `label <id> <verdictArgs…>`, flash the
+    /// returned score delta on that row, then re-poll status + review. `verdictArgs`
+    /// is exactly one of `["--goal", id]`, `["--off-track"]`, `["--not-work"]`,
+    /// `["--confirm"]`. The row's spinner is keyed `label-<id>`.
+    func labelSession(_ id: String, _ verdictArgs: [String]) {
+        let key = "label-\(id)"
+        guard !busyActions.contains(key) else { return }
+        busyActions.insert(key)
+        Task {
+            let result = await client.runAsync(["label", id] + verdictArgs, timeout: 20)
+            self.busyActions.remove(key)
+            switch result {
+            case .success(let output):
+                if let delta = Self.parseScoreDelta(output) {
+                    self.reviewFlash[id] = delta
+                }
+                // Update the header score immediately; let the flash linger on the
+                // row a beat before reloading review (which drops the row).
+                self.refresh()
+                Task {
+                    try? await Task.sleep(nanoseconds: 1_400_000_000)
+                    self.loadReview()
+                    self.reviewFlash[id] = nil
+                }
+            case .failure(let err):
+                self.actionMessage = ActionMessage(text: err.description, isError: true)
+            }
+        }
+    }
+
+    /// Confirm every still-unreviewed session that has a current assignment
+    /// (`--confirm` errors on a null-verdict session, so those are skipped and
+    /// must be resolved individually). Runs sequentially to avoid interleaved
+    /// score recomputes, then reloads once.
+    func confirmAllReview() {
+        let targets = (review?.sessions ?? []).filter { $0.needsReview && $0.verdict != nil }
+        guard !targets.isEmpty else { return }
+        let key = "confirm-all"
+        guard !busyActions.contains(key) else { return }
+        busyActions.insert(key)
+        Task {
+            for s in targets {
+                _ = await client.runAsync(["label", s.id, "--confirm"], timeout: 20)
+            }
+            self.busyActions.remove(key)
+            self.actionMessage = ActionMessage(text: "confirmed \(targets.count) session\(targets.count == 1 ? "" : "s")", isError: false)
+            self.refresh()
+            self.loadReview()
+        }
+    }
+
+    /// Extract the score delta from a `label` line like
+    /// `labeled … score 66 -> 71`, formatted as `66 → 71`. Each side may be an
+    /// integer or the literal `insufficient data`. Returns nil if not found.
+    static func parseScoreDelta(_ output: String) -> String? {
+        for rawLine in output.split(separator: "\n").reversed() {
+            let line = String(rawLine)
+            guard let r = line.range(of: "score ") else { continue }
+            let rest = String(line[r.upperBound...])
+            let parts = rest.components(separatedBy: "->")
+            guard parts.count == 2 else { continue }
+            let lhs = parts[0].trimmingCharacters(in: .whitespaces)
+            let rhs = parts[1].trimmingCharacters(in: .whitespaces)
+            if lhs.isEmpty || rhs.isEmpty { continue }
+            return "\(lhs) → \(rhs)"
+        }
+        return nil
     }
 
     // MARK: - Write actions
@@ -396,13 +509,16 @@ final class StatusStore: ObservableObject {
         if lastError != nil, status == nil { return .off }
         guard let s = status else { return .loading }
         if lastError != nil { return .off }
+        if !s.score.scored { return .unscored }   // < 30 active min -> grey, no number
         return s.score.onTrack ? .onTrack : .drifting
     }
 
-    /// The number shown in the menu bar, or "--" when we have nothing.
+    /// The number shown in the menu bar. Empty on an unscored day (the icon then
+    /// shows a bare grey gauge) and "--" before the first successful poll.
     var scoreText: String {
         guard let s = status else { return "--" }
-        return "\(s.score.overall)"
+        guard s.score.scored, let overall = s.score.overall else { return "" }
+        return "\(overall)"
     }
 
     // MARK: - Helpers

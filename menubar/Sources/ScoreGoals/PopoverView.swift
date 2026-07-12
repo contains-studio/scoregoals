@@ -16,14 +16,23 @@ struct PopoverView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var focusMinutes = 50
     @State private var showHistory = false
+    /// Header score tapped -> per-goal evidence breakdown (source: review --json).
+    @State private var showEvidence = false
+    /// Review pane "N more…" expander (collapsed shows the 6 biggest).
+    @State private var reviewExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if showEvidence, scoreIsEvidenceable {
+                evidenceView
+            }
             Divider().padding(.vertical, 8)
             nowLine
             Divider().padding(.vertical, 8)
             intentionsSection
+            Divider().padding(.vertical, 8)
+            reviewSection
             Divider().padding(.vertical, 8)
             focusSection
             Divider().padding(.vertical, 8)
@@ -41,39 +50,78 @@ struct PopoverView: View {
 
     private var header: some View {
         HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(store.status.map { "\($0.score.overall)" } ?? "--")
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(store.barState.tint)
-                    Text("/ 100")
-                        .font(.caption)
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { showEvidence.toggle() }
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(scoreNumber)
+                            .font(.system(size: 30, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(store.barState.tint)
+                        if scoreShowsDenominator {
+                            Text("/ 100")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if scoreIsEvidenceable {
+                            Image(systemName: showEvidence ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                                .padding(.leading, 1)
+                        }
+                    }
+                    Text(onTrackText)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
-                }
-                Text(onTrackText)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                if let date = store.status?.date, !date.isEmpty {
-                    Text(date)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let date = store.status?.date, !date.isEmpty {
+                        Text(date)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
+            .buttonStyle(.plain)
+            .disabled(!scoreIsEvidenceable)
+            .help(scoreIsEvidenceable
+                  ? (showEvidence ? "Hide score breakdown" : "Show score breakdown")
+                  : "")
             Spacer()
             Menu {
                 Button("Settings…") { openSettings() }
-                Button("Refresh now") { store.refresh() }
+                Button("Refresh now") { store.refresh(); store.loadReview() }
                 Divider()
                 Button("Quit ScoreGoals") { NSApplication.shared.terminate(nil) }
             } label: {
                 Image(systemName: "gearshape")
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
             .frame(width: 22)
         }
+    }
+
+    /// The big header number: "--" before first poll, "—" on an unscored day,
+    /// else the score. Never force-unwraps a nullable `overall`.
+    private var scoreNumber: String {
+        guard let s = store.status else { return "--" }
+        guard s.score.scored, let overall = s.score.overall else { return "—" }
+        return "\(overall)"
+    }
+
+    /// "/ 100" only reads right next to a real number.
+    private var scoreShowsDenominator: Bool {
+        guard let s = store.status else { return false }
+        return s.score.scored && s.score.overall != nil
+    }
+
+    /// The breakdown only makes sense once we have a scored day with sessions.
+    private var scoreIsEvidenceable: Bool {
+        scoreShowsDenominator
     }
 
     private func openSettings() {
@@ -85,11 +133,67 @@ struct PopoverView: View {
         if !store.engineResolved { return "engine not found — set path in Settings" }
         if store.status == nil, store.lastError != nil { return "engine unavailable" }
         guard let s = store.status else { return "loading…" }
+        if !s.score.scored {
+            return "not enough captured time yet (\(Int(s.score.activeMinutes))m)"
+        }
         switch store.barState {
         case .onTrack:  return "on track"
         case .drifting: return "drifting"
         default:        return s.score.onTrack ? "on track" : "drifting"
         }
+    }
+
+    // MARK: - Score evidence breakdown (review --json, grouped by assignment)
+
+    /// The score breakdown shown under the header when the score is tapped.
+    /// Groups every reviewed session by its resolved assignment, biggest first.
+    private var evidenceView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionHeader("SCORE BREAKDOWN")
+                Spacer()
+                if let am = store.review?.score.activeMinutes {
+                    Text("\(Int(am))m active")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            if let groups = evidenceGroups {
+                if groups.isEmpty {
+                    Text("no sessions captured yet")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(groups) { group in
+                        EvidenceGroupView(group: group)
+                    }
+                }
+            } else if let err = store.reviewError {
+                Label(err, systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            } else {
+                Text("loading…")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    /// Sessions grouped by assignment label, each with a minutes total, ordered
+    /// biggest-first. Nil while review has never loaded (drives the loading state).
+    private var evidenceGroups: [EvidenceGroup]? {
+        guard let sessions = store.review?.sessions else { return nil }
+        let grouped = Dictionary(grouping: sessions, by: { $0.assignmentLabel })
+        return grouped.map { label, sess in
+            EvidenceGroup(id: label,
+                          label: label,
+                          minutes: sess.reduce(0) { $0 + $1.minutes },
+                          sessions: sess.sorted { $0.minutes > $1.minutes })
+        }
+        .sorted { $0.minutes > $1.minutes }
     }
 
     // MARK: - 2. NOW line
@@ -232,6 +336,93 @@ struct PopoverView: View {
         return f.string(from: d)
     }
 
+    // MARK: - 3b. REVIEW (needs_review sessions -> one-gesture corrections)
+
+    /// Sessions still awaiting a correction, biggest minutes first (the engine
+    /// already returns uncertain-first; we re-sort to be certain).
+    private var reviewPending: [ReviewSession] {
+        (store.review?.sessions ?? [])
+            .filter { $0.needsReview }
+            .sorted { $0.minutes > $1.minutes }
+    }
+
+    /// Active goals for the per-row goal picker (drop the `unaligned` pseudo-goal).
+    private var reviewGoals: [GoalRow] { focusGoals }
+
+    /// Pending sessions that already have an assignment `--confirm` can accept.
+    private var confirmAllCount: Int { reviewPending.filter { $0.verdict != nil }.count }
+
+    private var reviewSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionHeader("REVIEW")
+                if !reviewPending.isEmpty {
+                    Text("\(reviewPending.count)")
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Color.orange, in: Capsule())
+                }
+                Spacer()
+            }
+            reviewBody
+        }
+    }
+
+    @ViewBuilder private var reviewBody: some View {
+        if store.review == nil {
+            if let err = store.reviewError {
+                Label(err, systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("loading review…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else if reviewPending.isEmpty {
+            Label("All reviewed", systemImage: "checkmark.seal.fill")
+                .font(.callout)
+                .foregroundStyle(.green)
+        } else {
+            let visible = reviewExpanded ? reviewPending : Array(reviewPending.prefix(6))
+            ForEach(visible) { session in
+                ReviewRow(session: session, goals: reviewGoals, store: store)
+            }
+            HStack(spacing: 8) {
+                if reviewPending.count > 6 {
+                    Button(reviewExpanded ? "Show less"
+                                          : "\(reviewPending.count - 6) more…") {
+                        withAnimation { reviewExpanded.toggle() }
+                    }
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+                }
+                Spacer()
+                if confirmAllCount > 0 {
+                    Button {
+                        store.confirmAllReview()
+                    } label: {
+                        if store.busyActions.contains("confirm-all") {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Confirm all (\(confirmAllCount))")
+                        }
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                    .disabled(store.busyActions.contains("confirm-all"))
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+
     // MARK: - 4. FOCUS
 
     private var focusSection: some View {
@@ -358,7 +549,7 @@ struct PopoverView: View {
                 actionButton("Capture", "camera.viewfinder", key: "capture") { store.captureNow() }
                 actionButton("EOD", "doc.text", key: "report") { store.generateReport() }
                 actionButton("Plan", "sun.max", key: "plan") { store.planDay() }
-                actionButton("Refresh", "arrow.clockwise", key: "refresh") { store.refresh() }
+                actionButton("Refresh", "arrow.clockwise", key: "refresh") { store.refresh(); store.loadReview() }
             }
             if let msg = store.actionMessage {
                 Label(msg.text, systemImage: msg.isError ? "exclamationmark.triangle.fill" : "checkmark.circle")
@@ -657,5 +848,173 @@ struct WeekBars: View {
     private func barColor(_ score: Int?) -> Color {
         guard let score else { return Color.secondary.opacity(0.25) }
         return score >= 60 ? .green : .orange
+    }
+}
+
+// MARK: - Review
+
+/// One review row: minutes + app + title on top, one-gesture correction controls
+/// (goal picker · Off-track · Not work · ✓ confirm) below — or a score-delta flash
+/// after a label lands. Every control calls `label` through the same CLI surface.
+struct ReviewRow: View {
+    let session: ReviewSession
+    let goals: [GoalRow]
+    @ObservedObject var store: StatusStore
+
+    private var busy: Bool { store.busyActions.contains("label-\(session.id)") }
+    private var flash: String? { store.reviewFlash[session.id] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Line 1 — minutes · app · title (title truncates in the middle).
+            HStack(spacing: 6) {
+                Text("\(Int(session.minutes.rounded()))m")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 28, alignment: .leading)
+                Text(session.app ?? "unknown")
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                if let title = session.title, !title.isEmpty {
+                    Text(title)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 4)
+            }
+
+            // Line 2 — the flash, else the correction controls.
+            if let flash {
+                Label(flash, systemImage: "checkmark.circle.fill")
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.green)
+            } else {
+                HStack(spacing: 8) {
+                    Menu {
+                        ForEach(goals) { g in
+                            Button(g.goalName) {
+                                store.labelSession(session.id, ["--goal", g.goalId])
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "tag")
+                                .font(.system(size: 9))
+                            Text(currentGoalLabel)
+                                .lineLimit(1)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                        }
+                        .frame(maxWidth: 130, alignment: .leading)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .font(.caption2)
+                    .disabled(busy || goals.isEmpty)
+
+                    Spacer(minLength: 4)
+
+                    if busy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button("Off-track") {
+                            store.labelSession(session.id, ["--off-track"])
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                        .help("worked, but on no goal")
+
+                        Button("Not work") {
+                            store.labelSession(session.id, ["--not-work"])
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                        .help("out of scope — excluded from active time")
+
+                        Button {
+                            store.labelSession(session.id, ["--confirm"])
+                        } label: {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(session.verdict == nil ? Color.secondary : Color.green)
+                        .disabled(session.verdict == nil)
+                        .help(session.verdict == nil
+                              ? "no current assignment to confirm"
+                              : "confirm \(session.assignmentLabel)")
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    /// The goal picker's current selection: the resolved goal, or a prompt.
+    private var currentGoalLabel: String {
+        if let name = session.goalName, !name.isEmpty { return name }
+        switch session.verdict {
+        case "off_track": return "Off-track"
+        case "not_work":  return "Not work"
+        default:          return "Pick goal"
+        }
+    }
+}
+
+// MARK: - Score evidence
+
+/// One assignment group in the score breakdown: a goal (or Off-track / Not work /
+/// Unmatched) with its total minutes and the read-only sessions behind it.
+struct EvidenceGroup: Identifiable {
+    let id: String
+    let label: String
+    let minutes: Double
+    let sessions: [ReviewSession]
+}
+
+struct EvidenceGroupView: View {
+    let group: EvidenceGroup
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 6, height: 6)
+                Text(group.label)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                Text("\(Int(group.minutes.rounded()))m")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(group.sessions) { s in
+                HStack(spacing: 6) {
+                    Text(s.span)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 86, alignment: .leading)
+                    Text(s.app ?? "—")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 6)
+                    Text("\(Int(s.minutes.rounded()))m")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.leading, 12)
+            }
+        }
+    }
+
+    private var dotColor: Color {
+        switch group.label {
+        case "Off-track", "Unmatched": return .orange
+        case "Not work":               return .secondary
+        default:                        return .green
+        }
     }
 }

@@ -94,6 +94,26 @@ struct SettingsView: View {
                     .foregroundStyle(.tertiary)
             }
 
+            Section("Learning") {
+                HStack {
+                    Text("Learned rules")
+                    Spacer()
+                    Text("\(store.status?.learning.activeRules ?? 0)")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("Corrections / wk trend")
+                    Spacer()
+                    Text(correctionsTrend)
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Text(learningBlurb)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
             Section("Gemini API key (BYOK)") {
                 SecureField("Paste key to enable Gemini (optional)", text: $geminiKey)
                     .textFieldStyle(.roundedBorder)
@@ -230,6 +250,23 @@ struct SettingsView: View {
 
     private var screenpipeOK: Bool {
         store.status?.health.screenpipe.ok ?? false
+    }
+
+    /// "12 → 3" from the learning KPI's weekly correction counts (first→last),
+    /// a single count when there's one week, or "—" when there's no history yet.
+    private var correctionsTrend: String {
+        let counts = (store.status?.learning.correctionsByWeek ?? []).map(\.count)
+        switch counts.count {
+        case 0:  return "—"
+        case 1:  return "\(counts[0])"
+        default: return "\(counts.first!) → \(counts.last!)"
+        }
+    }
+
+    private var learningBlurb: String {
+        let thisWeek = store.status?.correctionsThisWeek ?? 0
+        return "\(thisWeek) correction\(thisWeek == 1 ? "" : "s") this week. "
+            + "Confirming the engine's guesses promotes learned rules, so corrections trend toward zero."
     }
 
     private func load() {

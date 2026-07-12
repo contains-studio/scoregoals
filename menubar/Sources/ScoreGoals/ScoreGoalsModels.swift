@@ -33,6 +33,9 @@ struct ScoreGoalsStatus: Codable {
     var score: Score = Score()
     var goals: [GoalRow] = []
     var driftFlags: [String] = []
+    var review: Review = Review()
+    var correctionsThisWeek: Int = 0
+    var learning: Learning = Learning()
     var intentions: Intentions = Intentions()
     var focus: Focus = Focus()
     var nextEvent: NextEvent? = nil
@@ -48,6 +51,9 @@ struct ScoreGoalsStatus: Codable {
         case generatedAt = "generated_at"
         case now, score, goals
         case driftFlags = "drift_flags"
+        case review
+        case correctionsThisWeek = "corrections_this_week"
+        case learning
         case intentions, focus
         case nextEvent = "next_event"
         case week, health, warnings
@@ -62,6 +68,9 @@ struct ScoreGoalsStatus: Codable {
         score = c.tolerant(Score.self, .score, Score())
         goals = c.tolerant([GoalRow].self, .goals, [])
         driftFlags = c.tolerant([String].self, .driftFlags, [])
+        review = c.tolerant(Review.self, .review, Review())
+        correctionsThisWeek = c.tolerant(Int.self, .correctionsThisWeek, 0)
+        learning = c.tolerant(Learning.self, .learning, Learning())
         intentions = c.tolerant(Intentions.self, .intentions, Intentions())
         focus = c.tolerant(Focus.self, .focus, Focus())
         nextEvent = c.optional(NextEvent.self, .nextEvent)
@@ -111,23 +120,86 @@ struct Now: Codable {
 // MARK: - score
 
 struct Score: Codable {
-    var overall: Int = 0
+    /// The 0–100 day score, or `nil` when the day is unscored (< 30 active min).
+    /// MUST stay optional: a non-optional Int here would crash on a short day.
+    var overall: Int? = nil
+    /// `false` => insufficient captured data; `overall` is then `nil`.
+    var scored: Bool = false
     var onTrack: Bool = false
     var activeMinutes: Double = 0
 
     init() {}
 
     enum CodingKeys: String, CodingKey {
-        case overall
+        case overall, scored
         case onTrack = "on_track"
         case activeMinutes = "active_minutes"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        overall = c.tolerant(Int.self, .overall, 0)
+        overall = c.optional(Int.self, .overall)
+        // If an older engine omits `scored`, infer it from `overall`'s presence
+        // so a real number never renders as insufficient-data.
+        scored = c.tolerant(Bool.self, .scored, overall != nil)
         onTrack = c.tolerant(Bool.self, .onTrack, false)
         activeMinutes = c.tolerant(Double.self, .activeMinutes, 0)
+    }
+}
+
+// MARK: - review / learning (status surfaces)
+
+/// `status.review` — the correction backlog badge.
+struct Review: Codable {
+    var needsReview: Int = 0
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case needsReview = "needs_review"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        needsReview = c.tolerant(Int.self, .needsReview, 0)
+    }
+}
+
+/// `status.learning` — the learning KPI surface.
+struct Learning: Codable {
+    var activeRules: Int = 0
+    var correctionsByWeek: [CorrectionWeek] = []
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case activeRules = "active_rules"
+        case correctionsByWeek = "corrections_by_week"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        activeRules = c.tolerant(Int.self, .activeRules, 0)
+        correctionsByWeek = c.tolerant([CorrectionWeek].self, .correctionsByWeek, [])
+    }
+}
+
+struct CorrectionWeek: Codable, Identifiable {
+    var week: String = ""
+    var count: Int = 0
+
+    var id: String { week }
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case week, count
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        week = c.tolerant(String.self, .week, "")
+        count = c.tolerant(Int.self, .count, 0)
     }
 }
 
@@ -532,6 +604,111 @@ struct HistoryItem: Codable, Identifiable {
         text = c.tolerant(String.self, .text, "")
         done = c.tolerant(Bool.self, .done, false)
         carriedFrom = c.optional(String.self, .carriedFrom)
+    }
+}
+
+// MARK: - review (`review --json`)
+
+/// The full Review & Correct surface: the day's score plus every session
+/// resolved to a verdict, uncertain-first. Drives both the Review pane and the
+/// score-evidence breakdown (same single engine call).
+struct ReviewResponse: Codable {
+    var date: String = ""
+    var score: ReviewScore = ReviewScore()
+    var needsReview: Int = 0
+    var sessions: [ReviewSession] = []
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case date, score
+        case needsReview = "needs_review"
+        case sessions
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        date = c.tolerant(String.self, .date, "")
+        score = c.tolerant(ReviewScore.self, .score, ReviewScore())
+        needsReview = c.tolerant(Int.self, .needsReview, 0)
+        sessions = c.tolerant([ReviewSession].self, .sessions, [])
+    }
+}
+
+/// `review.score` — the same nullable/guarded shape as `status.score` (no on_track).
+struct ReviewScore: Codable {
+    var overall: Int? = nil
+    var scored: Bool = false
+    var activeMinutes: Double = 0
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case overall, scored
+        case activeMinutes = "active_minutes"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        overall = c.optional(Int.self, .overall)
+        scored = c.tolerant(Bool.self, .scored, overall != nil)
+        activeMinutes = c.tolerant(Double.self, .activeMinutes, 0)
+    }
+}
+
+/// One session row from `review --json`. `id` is the handle `label` takes.
+struct ReviewSession: Codable, Identifiable {
+    var id: String = ""
+    var start: String = ""
+    var end: String = ""
+    var span: String = ""
+    var app: String? = nil
+    var title: String? = nil
+    var minutes: Double = 0
+    var goalId: String? = nil
+    var goalName: String? = nil
+    var verdict: String? = nil
+    var confidence: Double = 0
+    var verdictSource: String = "none"
+    var needsReview: Bool = false
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case id, start, end, span, app, title, minutes
+        case goalId = "goal_id"
+        case goalName = "goal_name"
+        case verdict, confidence
+        case verdictSource = "verdict_source"
+        case needsReview = "needs_review"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.tolerant(String.self, .id, "")
+        start = c.tolerant(String.self, .start, "")
+        end = c.tolerant(String.self, .end, "")
+        span = c.tolerant(String.self, .span, "")
+        app = c.optional(String.self, .app)
+        title = c.optional(String.self, .title)
+        minutes = c.tolerant(Double.self, .minutes, 0)
+        goalId = c.optional(String.self, .goalId)
+        goalName = c.optional(String.self, .goalName)
+        verdict = c.optional(String.self, .verdict)
+        confidence = c.tolerant(Double.self, .confidence, 0)
+        verdictSource = c.tolerant(String.self, .verdictSource, "none")
+        needsReview = c.tolerant(Bool.self, .needsReview, false)
+    }
+
+    /// The human label for how this session is currently assigned — used both as
+    /// the goal-picker's current selection and the evidence-group key.
+    var assignmentLabel: String {
+        if let name = goalName, !name.isEmpty { return name }
+        switch verdict {
+        case "off_track": return "Off-track"
+        case "not_work":  return "Not work"
+        default:          return "Unmatched"
+        }
     }
 }
 
