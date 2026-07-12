@@ -817,6 +817,72 @@ def _check_screenpipe(cfg: Config) -> tuple[bool, str]:
         )
 
 
+def _check_capture(cfg: Config) -> list[tuple[str, bool, str]]:
+    """Deep capture health (only when screenpipe is reachable): is the recorder
+    app alive, are frames fresh, is audio capturing, is accessibility text
+    flowing? This is the 'is it actually working' test."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    rows: list[tuple[str, bool, str]] = []
+
+    # recorder wrapper process
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "ScreenpipeRecorder.app/Contents/MacOS"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = out.stdout.split()
+        rows.append(
+            ("recorder app", bool(pids),
+             f"running (pid {pids[0]})" if pids
+             else "not running — open recorder/ScreenpipeRecorder.app")
+        )
+    except Exception:
+        rows.append(("recorder app", False, "could not probe processes"))
+
+    try:
+        health = _json.loads(_http_get(f"{cfg.screenpipe_url}/health"))
+    except Exception:
+        rows.append(("capture", False, "health endpoint unreadable"))
+        return rows
+
+    # frame freshness (away-pause makes staleness legitimate when idle/locked)
+    ts = health.get("last_frame_timestamp")
+    try:
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(str(ts)).astimezone(timezone.utc)
+               ).total_seconds()
+        fresh = age < 180
+        rows.append(
+            ("frames", fresh,
+             f"last frame {int(age)}s ago" if fresh else
+             f"stale ({int(age // 60)}m) — away-paused, or Screen Recording not granted")
+        )
+    except Exception:
+        rows.append(("frames", False,
+                     f"no frame timestamp ({ts!r}) — Screen Recording not granted?"))
+
+    # audio devices
+    dev = str(health.get("device_status_details") or "")
+    rows.append(
+        ("audio", "active" in dev,
+         dev[:70] if dev else "no audio devices — Microphone not granted?")
+    )
+
+    # accessibility text (cleaner than OCR; needs the Accessibility grant)
+    acc = health.get("accessibility") or {}
+    chars = acc.get("total_text_chars") or 0
+    walks = acc.get("walks_deduped") or 0
+    ok = bool(chars or walks)
+    rows.append(
+        ("a11y text", ok,
+         f"{walks} walks, {chars} chars" if ok else
+         "none yet — grant Accessibility to ScreenpipeRecorder (or wait ~1 min after launch)")
+    )
+    return rows
+
+
 def _check_ollama(cfg: Config) -> tuple[bool, str]:
     import json as _json
 
@@ -913,6 +979,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cfg = _cfg(args)
     checks: list[tuple[str, bool, str]] = [
         ("screenpipe", *_check_screenpipe(cfg)),
+    ]
+    if checks[0][1]:  # screenpipe reachable -> run the deep capture test
+        checks += _check_capture(cfg)
+    checks += [
         ("ollama", *_check_ollama(cfg)),
         ("gemini", *_check_gemini(cfg)),
         ("icalBuddy", *_check_tool("icalBuddy", "`brew install ical-buddy` for calendar capture")),
