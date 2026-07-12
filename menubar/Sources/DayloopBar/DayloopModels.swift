@@ -379,6 +379,28 @@ struct DayloopConfig: Codable, Equatable {
     }
 }
 
+// MARK: - goals file (`goals --json`)
+
+/// The goals.md surface returned by `dayloop goals --json`: the file path and
+/// its verbatim text (the Goals editor loads `raw` into its TextEditor). The
+/// parsed `goals[]` array is present in the JSON but unused by the app.
+struct GoalsFile: Codable {
+    var path: String = ""
+    var raw: String = ""
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case path, raw
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = c.tolerant(String.self, .path, "")
+        raw = c.tolerant(String.self, .raw, "")
+    }
+}
+
 struct Backend: Codable {
     // `default` is a Swift keyword — mapped to `defaultBackend`.
     var defaultBackend: String = "ollama"

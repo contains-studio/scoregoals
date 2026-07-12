@@ -394,6 +394,110 @@ def cmd_config_set(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- goals (show / write / json — menu bar Goals editor surface) -------------
+
+
+def _goals_payload(cfg: Config) -> dict:
+    """Build the `goals --json` object: the file path, its verbatim text, and
+    the parsed goals (id/name/keywords/target_pct)."""
+    from .compare import align
+
+    try:
+        raw = Path(cfg.goals_path).read_text(encoding="utf-8")
+    except OSError:
+        raw = ""
+    goals = align.load_goals(cfg)
+    return {
+        "path": cfg.goals_path,
+        "raw": raw,
+        "goals": [
+            {"id": g.id, "name": g.name, "keywords": g.keywords, "target_pct": g.target_pct}
+            for g in goals
+        ],
+    }
+
+
+def _print_goals_summary(payload: dict) -> None:
+    print(f"goals.md: {payload['path']}")
+    goals = payload["goals"]
+    if not goals:
+        print("  (no goals parsed)")
+        return
+    for g in goals:
+        tgt = f" (target {g['target_pct']:.0f}%)" if g.get("target_pct") is not None else ""
+        kws = ", ".join(g.get("keywords") or [])
+        print(f"  - {g['id']}: {g['name']}{tgt}")
+        if kws:
+            print(f"      keywords: {kws}")
+
+
+def cmd_goals(args: argparse.Namespace) -> int:
+    """goals [--json]: show the parsed goals (or the full JSON surface)."""
+    cfg = _cfg(args)
+    payload = _goals_payload(cfg)
+    if getattr(args, "json", False):
+        _print_json(payload)
+        return 0
+    _print_goals_summary(payload)
+    return 0
+
+
+def cmd_goals_show(args: argparse.Namespace) -> int:
+    """goals show [--raw]: print goals.md verbatim (--raw) or a parsed summary."""
+    cfg = _cfg(args)
+    if getattr(args, "raw", False):
+        try:
+            sys.stdout.write(Path(cfg.goals_path).read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"dayloop: cannot read {cfg.goals_path}: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    _print_goals_summary(_goals_payload(cfg))
+    return 0
+
+
+def cmd_goals_write(args: argparse.Namespace) -> int:
+    """goals write: read new markdown from STDIN, atomically overwrite goals.md
+    (temp file + rename), then parse it and print a one-line summary. Never
+    rejects the write — if the new content parses to ZERO goals, it is still
+    written and a clear warning goes to stderr (the file may be mid-draft)."""
+    import os
+    import tempfile
+
+    cfg = _cfg(args)
+    from .compare import align
+
+    data = sys.stdin.read()
+    path = Path(cfg.goals_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Atomic replace: write a temp file in the same directory, then os.replace.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".goals-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    goals = align.load_goals(cfg)  # re-reads the file we just wrote
+    if not goals:
+        print(
+            f"warning: wrote {path} but it parsed to ZERO goals —"
+            " check the '## Goal: <name>' format",
+            file=sys.stderr,
+        )
+        print("wrote goals.md (0 goals)")
+        return 0
+    ids = ", ".join(g.id for g in goals)
+    print(f"wrote goals.md ({len(goals)} goals: {ids})")
+    return 0
+
+
 # --- doctor (FULLY IMPLEMENTED) ----------------------------------------------
 
 
@@ -464,12 +568,24 @@ def _check_ollama(cfg: Config) -> tuple[bool, str]:
 
 
 def _check_gemini(cfg: Config) -> tuple[bool, str]:
+    """Report which gemini path is active, probing in the same order analyze()
+    resolves: API key, then agy (Antigravity), then the legacy gemini CLI."""
+    agy = _which("agy")
     cli = _which("gemini")
     if cfg.gemini_api_key:
-        return True, "GEMINI_API_KEY set" + (f"; CLI at {cli}" if cli else "")
+        extra = f"; agy at {agy}" if agy else (f"; legacy CLI at {cli}" if cli else "")
+        return True, f"API key ({cfg.gemini_model}){extra}"
+    if agy:
+        return True, f"agy (Antigravity) at {agy} — model {cfg.gemini_model}, no key needed"
     if cli:
-        return True, f"no GEMINI_API_KEY, but gemini CLI (OAuth) at {cli}"
-    return False, "no GEMINI_API_KEY and no gemini CLI — gemini backend unavailable (ollama still works)"
+        return True, (
+            f"gemini CLI (legacy, deprecated) at {cli}"
+            " — install Antigravity for gemini-3.5-flash: `brew install antigravity-cli`"
+        )
+    return False, (
+        "no GEMINI_API_KEY, no agy, no legacy gemini CLI — gemini backend unavailable"
+        " (install Antigravity: `brew install antigravity-cli`; ollama still works)"
+    )
 
 
 def _check_tool(name: str, hint: str) -> tuple[bool, str]:
@@ -623,6 +739,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("key", help="setting key")
     q.add_argument("value", help="new value")
     q.set_defaults(func=cmd_config_set)
+
+    # goals — show / edit goals.md (menu bar Goals editor surface) -------------
+    p_goals = sub.add_parser("goals", help="show or edit goals.md (menu bar Goals editor)")
+    p_goals.add_argument("--json", action="store_true", help="print {path, raw, goals[]} as JSON")
+    p_goals.set_defaults(func=cmd_goals, goals_action=None)
+    goals_sub = p_goals.add_subparsers(dest="goals_action", metavar="action")
+    q = goals_sub.add_parser("show", help="print goals.md (use --raw for the verbatim file text)")
+    q.add_argument("--raw", action="store_true", help="print the file verbatim (no parsing)")
+    q.set_defaults(func=cmd_goals_show)
+    q = goals_sub.add_parser("write", help="overwrite goals.md from STDIN (atomic), then summarize")
+    q.set_defaults(func=cmd_goals_write)
 
     p = sub.add_parser("doctor", help="check external tools + services, print a checklist")
     p.set_defaults(func=cmd_doctor)

@@ -50,7 +50,7 @@ DEFAULTS: dict = {
     "screenpipe_url": "http://localhost:3030",
     "ollama_url": "http://localhost:11434",
     "ollama_model": "huihui_ai/qwen3-abliterated:4b-thinking-2507-fp16",
-    "gemini_model": "gemini-2.5-flash",
+    "gemini_model": "gemini-3.5-flash",  # served by agy (Antigravity); SDK path too when keyed
     "gemini_price_in_per_1m": 0.30,   # USD per 1M input tokens — editable placeholder
     "gemini_price_out_per_1m": 2.50,  # USD per 1M output tokens — editable placeholder
     "projects_dir": _default_projects_dir(),

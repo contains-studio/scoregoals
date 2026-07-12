@@ -284,6 +284,49 @@ Environment overrides (highest precedence): `DAYLOOP_DEFAULT_BACKEND`,
   "capture_paused": false,
   "refresh_seconds": 30,
   "ollama_url": "http://localhost:11434",
-  "gemini_model": "gemini-2.5-flash"
+  "gemini_model": "gemini-3.5-flash"
+}
+```
+
+---
+
+## `dayloop goals --json`
+
+The `goals.md` editing surface used by the menu bar Goals editor: the file path,
+its verbatim text, and the parsed goals. The Swift app loads `raw` into a
+`TextEditor` and writes edits back via `goals write` (below).
+
+| field | type | notes |
+|------|------|------|
+| `path` | string | absolute path to `goals.md` |
+| `raw` | string | the file's verbatim UTF-8 text (`""` if unreadable) |
+| `goals` | array of object | parsed goals in `goals.md` order (may be empty) |
+
+`goals[]`:
+
+| field | type | notes |
+|------|------|------|
+| `id` | string | slug of the name (`ship-dayloop`), duplicate slugs get `-2`, `-3`, … |
+| `name` | string | display name from the `## Goal: <name>` heading |
+| `keywords` | array of string | lowercased keywords for session matching |
+| `target_pct` | number \| null | desired % of active time; null when untargeted |
+
+Related commands (human-readable stdout, not JSON): `goals show --raw` prints the
+file verbatim; `goals write` reads new markdown from **STDIN**, atomically
+overwrites `goals.md` (temp file + rename), then prints a one-line summary
+`wrote goals.md (N goals: id1, id2, …)`. The write **never rejects**: if the new
+content parses to zero goals it is still written and a warning goes to stderr
+(the file may be mid-draft). Bare `dayloop goals` pretty-prints the summary.
+
+### Example
+
+```json
+{
+  "path": "/Users/you/projects/dayloop/goals.md",
+  "raw": "## Goal: Ship dayloop\nkeywords: dayloop, screenpipe\ntarget_pct: 35\n…",
+  "goals": [
+    { "id": "ship-dayloop", "name": "Ship dayloop", "keywords": ["dayloop", "screenpipe"], "target_pct": 35.0 },
+    { "id": "deep-work-coding", "name": "Deep work / coding", "keywords": ["code", "vscode"], "target_pct": 50.0 }
+  ]
 }
 ```

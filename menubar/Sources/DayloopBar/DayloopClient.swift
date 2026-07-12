@@ -228,11 +228,40 @@ struct DayloopClient {
         }
     }
 
+    /// Like `runAction`, but feeds `stdin` to the child on its standard input
+    /// (used by `goals write`, which reads the new markdown from STDIN). Success
+    /// is a zero exit code; the trimmed stdout is returned. Blocking; off-main.
+    func runActionStdin(_ args: [String], stdin: String, timeout: TimeInterval = 20)
+        -> Result<String, DayloopError> {
+        switch execute(args, timeout: timeout, stdin: stdin) {
+        case .failure(let e):
+            return .failure(e)
+        case .success(let (status, out, err)):
+            if status != 0 {
+                return .failure(.nonZeroExit(status, String(data: err, encoding: .utf8) ?? ""))
+            }
+            let text = String(data: out, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return .success(text)
+        }
+    }
+
+    /// Async wrapper around `runActionStdin`.
+    func runAsyncStdin(_ args: [String], stdin: String, timeout: TimeInterval = 20)
+        async -> Result<String, DayloopError> {
+        await withCheckedContinuation { continuation in
+            Self.asyncQueue.async {
+                continuation.resume(returning: runActionStdin(args, stdin: stdin, timeout: timeout))
+            }
+        }
+    }
+
     // MARK: - Core process runner (shared)
 
     /// Launch the child, drain both pipes, enforce the timeout. Only fails for
     /// launch/timeout; otherwise returns `(terminationStatus, stdout, stderr)`.
-    private func execute(_ args: [String], timeout: TimeInterval) -> Result<(Int32, Data, Data), DayloopError> {
+    private func execute(_ args: [String], timeout: TimeInterval, stdin: String? = nil)
+        -> Result<(Int32, Data, Data), DayloopError> {
         log("run: \(Self.redactedArgs(args).joined(separator: " "))")
 
         let process = Process()
@@ -250,6 +279,11 @@ struct DayloopClient {
         let errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
+
+        // Feed stdin when provided (e.g. `goals write`). The child blocks on
+        // sys.stdin.read() until EOF, so we MUST write then close the handle.
+        let inPipe: Pipe? = stdin != nil ? Pipe() : nil
+        if let inPipe { process.standardInput = inPipe }
 
         // Drain both pipes concurrently so a full pipe buffer can never deadlock
         // the child, regardless of output size.
@@ -269,6 +303,16 @@ struct DayloopClient {
         } catch {
             log("launch failed: \(error.localizedDescription)")
             return .failure(.launch(error.localizedDescription))
+        }
+
+        // Write stdin off the wait path, then close so the child sees EOF. A
+        // broken pipe (child killed on timeout) is swallowed by `try?`.
+        if let inPipe, let data = stdin?.data(using: .utf8) {
+            ioQueue.async {
+                let handle = inPipe.fileHandleForWriting
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            }
         }
 
         // Enforce the timeout: wait on a separate thread, terminate if it overruns.

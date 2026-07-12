@@ -41,7 +41,8 @@ engine is erroring, so a frozen number never looks live.
 5. **TIME ON GOAL** — each goal with its share of time today and its target
    (`43% / 35%`), a green/amber progress bar vs target, plus a 7-day bar chart of
    scores, the on-track-days streak (`N/7`), and the **next calendar event** with
-   a countdown when one is scheduled.
+   a countdown when one is scheduled. A small **pencil** next to the header opens
+   Settings' Goals editor.
 6. **QUICK ACTIONS** — **Capture** (`capture <today>`), **EOD** (`report <today>
    --backend …`, then reveals `data/reports/<today>-eod.md` in Finder), **Plan**
    (`plan`), and **Refresh**. Each shows a spinner while running and the result
@@ -63,25 +64,39 @@ engine is erroring, so a frozen number never looks live.
 | Settings: default backend          | `config set default_backend <ollama\|gemini\|both>` |
 | Settings: nudges / pause capture   | `config set nudges_enabled\|capture_paused <bool>` |
 | Settings: refresh cadence          | `config set refresh_seconds <n>` + live re-poll |
+| Settings: Save goals               | `goals write` (new markdown piped on **stdin**) |
 
-Reads are `status --json` (every poll) and `config --json` (on launch + when
-Settings opens). `report`'s backend is derived from `status.health.backend.default`
-(`both` maps to `ollama`, since `report --backend` accepts only `ollama`/`gemini`).
+Reads are `status --json` (every poll), `config --json` (on launch + when Settings
+opens), and `goals --json` (when the Goals editor loads). `report`'s backend is
+derived from `status.health.backend.default` (`both` maps to `ollama`, since
+`report --backend` accepts only `ollama`/`gemini`).
 
 ## Settings
 
 Open **Settings…** from the gear menu. It loads current values from
 `config --json` and writes each change back through the engine:
 
-- **Default backend** — `ollama` / `gemini` / `both`.
+- **Default backend** — `ollama` / `gemini` / `both`. The `gemini` backend needs
+  no API key on this machine: it prefers the **Antigravity CLI** (`agy`, model
+  `gemini-3.5-flash`) when installed, falling back to the deprecated legacy
+  `gemini` CLI, and uses the google-genai SDK only when a key is set. Those
+  responses are covered by the Antigravity subscription, so their benchmarked
+  `cost_usd` is 0.
 - **Refresh cadence** — 15s / 30s / 1m / 5m. Writes `refresh_seconds` **and**
   updates the live poll cadence immediately.
 - **Nudges enabled** / **Pause capture** — boolean toggles.
+- **Goals** — a monospaced editor for `goals.md`, loaded from `goals --json` (the
+  verbatim `raw` field). Edit inline; an **edited** dot shows unsaved changes.
+  **Save goals** pipes the text to `goals write` on stdin (atomic temp+rename in
+  the engine), shows the returned summary line — e.g. `wrote goals.md (4 goals:
+  …)` — or an error inline, and re-polls so the day score reflects the new goals.
+  **Reload** re-fetches from disk; **Open file** opens `goals.md` in your default
+  editor. Saving never rejects: content that parses to zero goals is still written
+  (the engine warns), so a mid-draft file is never lost.
 - **Engine location** — a repo directory or engine binary, persisted in
   UserDefaults (key `dayloopEnginePath`) and used by `DayloopClient` so
   `$DAYLOOP_BIN` is no longer the only override. "Apply path" rebuilds the engine
   client and re-polls; the resolved invocation is shown below the field.
-- **Edit goals.md** — opens `goals.md` in your default editor.
 - **Launch at login** — see below.
 
 ## Launch at login

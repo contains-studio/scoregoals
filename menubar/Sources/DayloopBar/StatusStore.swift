@@ -43,6 +43,12 @@ final class StatusStore: ObservableObject {
     /// gemini_api_key`, which prints only "set"/"not set" — the key value is
     /// never read into the app.
     @Published private(set) var geminiKeyIsSet: Bool = false
+    /// Verbatim goals.md text (the `raw` field of `goals --json`), loaded on
+    /// demand by the Settings Goals editor.
+    @Published private(set) var goalsRaw: String = ""
+    /// True once `goals --json` has returned at least once, so the editor knows
+    /// the empty string means "no goals yet" rather than "not loaded".
+    @Published private(set) var goalsLoaded: Bool = false
     /// Keys of write actions currently in flight (e.g. "today", "focus", "capture").
     @Published private(set) var busyActions: Set<String> = []
     /// The last write action's result, shown inline; auto-clears on the next action.
@@ -253,6 +259,49 @@ final class StatusStore: ObservableObject {
                 notice: trimmed.isEmpty ? "Gemini key cleared" : "Gemini key saved",
                 refreshAfter: false) { [weak self] _ in
             self?.loadGeminiKeyState()
+        }
+    }
+
+    // Goals editor ------------------------------------------------------------
+
+    /// Load goals.md into `goalsRaw` via `goals --json` (the `raw` field).
+    func loadGoals() {
+        Task {
+            let result = await client.runAsync(["goals", "--json"], timeout: 8)
+            if case .success(let text) = result,
+               let data = text.data(using: .utf8),
+               let payload = try? JSONDecoder().decode(GoalsFile.self, from: data) {
+                self.goalsRaw = payload.raw
+                self.goalsLoaded = true
+            }
+        }
+    }
+
+    /// Save new goals.md content by piping it to `goals write` on stdin. On
+    /// success the engine echoes a one-line summary (e.g. "wrote goals.md (4
+    /// goals: …)"), which is surfaced inline and passed to `completion`; the
+    /// status is then re-polled since the day score depends on the goals. Never
+    /// crashes: a failed write shows the error and leaves the file untouched.
+    func saveGoals(_ markdown: String, completion: @escaping (Bool, String) -> Void) {
+        let key = "goals"
+        guard !busyActions.contains(key) else { return }
+        busyActions.insert(key)
+        actionMessage = nil
+        Task {
+            let result = await client.runAsyncStdin(["goals", "write"], stdin: markdown, timeout: 15)
+            self.busyActions.remove(key)
+            switch result {
+            case .success(let output):
+                let line = output.split(separator: "\n").first.map(String.init) ?? "goals saved"
+                self.actionMessage = ActionMessage(text: line, isError: false)
+                self.goalsRaw = markdown
+                self.goalsLoaded = true
+                self.refresh()   // goals changed -> re-evaluate the day score
+                completion(true, line)
+            case .failure(let err):
+                self.actionMessage = ActionMessage(text: err.description, isError: true)
+                completion(false, err.description)
+            }
         }
     }
 

@@ -42,6 +42,13 @@ struct SettingsView: View {
     @State private var loginHint: String?
     @State private var geminiKey = ""
 
+    // Goals editor state. `goalsText` is the editable buffer; `goalsOriginal` is
+    // the last loaded/saved content (the "edited" dot compares the two).
+    @State private var goalsText = ""
+    @State private var goalsOriginal = ""
+    @State private var goalsInitialized = false
+    @State private var goalsMessage: ActionMessage?
+
     private let refreshOptions: [(label: String, seconds: Int)] =
         [("15s", 15), ("30s", 30), ("1m", 60), ("5m", 300)]
 
@@ -110,12 +117,57 @@ struct SettingsView: View {
                     .foregroundStyle(.tertiary)
             }
 
+            Section("Goals") {
+                Text("Edit goals.md — one \"## Goal: <name>\" block per goal, each with a keywords line and an optional target_pct.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                TextEditor(text: $goalsText)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(height: 300)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                    )
+                    .disabled(!goalsInitialized)
+                HStack(spacing: 8) {
+                    Button {
+                        goalsMessage = nil
+                        store.saveGoals(goalsText) { ok, line in
+                            if ok { goalsOriginal = goalsText }
+                            goalsMessage = ActionMessage(text: line, isError: !ok)
+                        }
+                    } label: {
+                        if store.busyActions.contains("goals") {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Save goals")
+                        }
+                    }
+                    .disabled(store.busyActions.contains("goals")
+                              || !goalsInitialized
+                              || goalsText == goalsOriginal)
+                    if goalsInitialized, goalsText != goalsOriginal {
+                        Circle().fill(Color.orange).frame(width: 7, height: 7)
+                        Text("edited").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Reload") { store.loadGoals() }
+                    Button("Open file") { store.openGoalsFile() }
+                }
+                if let msg = goalsMessage {
+                    Label(msg.text,
+                          systemImage: msg.isError ? "exclamationmark.triangle.fill" : "checkmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(msg.isError ? .red : .green)
+                        .lineLimit(2)
+                }
+            }
+
             Section("Engine location") {
                 TextField("Repo directory or engine binary", text: $enginePath)
                     .textFieldStyle(.roundedBorder)
                 HStack {
                     Button("Apply path") { store.setEnginePath(enginePath) }
-                    Button("Edit goals.md") { store.openGoalsFile() }
                     Spacer()
                 }
                 Text(store.engineInvocation)
@@ -136,10 +188,13 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 400, height: 620)
+        .frame(width: 400, height: 720)
         .onAppear(perform: load)
         .onChange(of: store.config) { _, cfg in
             if let cfg { apply(cfg) }
+        }
+        .onChange(of: store.goalsRaw) { _, raw in
+            applyGoals(raw)
         }
     }
 
@@ -170,9 +225,20 @@ struct SettingsView: View {
     private func load() {
         store.loadConfig()
         store.loadGeminiKeyState()
+        store.loadGoals()
         enginePath = UserDefaults.standard.string(forKey: DayloopDefaults.enginePathKey) ?? ""
         loginEnabled = LoginItem.isEnabled
         if let cfg = store.config { apply(cfg) }
+        if store.goalsLoaded { applyGoals(store.goalsRaw) }
+    }
+
+    /// Load fetched goals.md text into the editor, but only the first time (or
+    /// after a Reload resets it) — never clobber edits the user has in flight.
+    private func applyGoals(_ raw: String) {
+        guard !goalsInitialized || goalsText == goalsOriginal else { return }
+        goalsText = raw
+        goalsOriginal = raw
+        goalsInitialized = true
     }
 
     private func apply(_ cfg: DayloopConfig) {

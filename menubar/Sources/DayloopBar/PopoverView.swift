@@ -238,6 +238,12 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 sectionHeader("TIME ON GOAL")
+                Button { openSettings() } label: {
+                    Image(systemName: "pencil").font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.tertiary)
+                .help("Edit goals.md")
                 Spacer()
                 if let week = store.status?.week, week.onTrackDays > 0 || !week.scores.isEmpty {
                     HStack(spacing: 6) {
