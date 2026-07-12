@@ -1,5 +1,14 @@
 import Foundation
 
+// MARK: - UserDefaults keys shared across the app
+
+enum DayloopDefaults {
+    /// A user-chosen repo directory *or* engine binary. When set (and valid) it
+    /// overrides the compiled-in default repo, so `DAYLOOP_BIN` isn't the only
+    /// way to relocate the engine. Persisted from Settings.
+    static let enginePathKey = "dayloopEnginePath"
+}
+
 // MARK: - Errors surfaced as a status, never thrown to a crash
 
 enum DayloopError: Error, CustomStringConvertible {
@@ -22,12 +31,14 @@ enum DayloopError: Error, CustomStringConvertible {
 
 /// Resolves how to invoke the dayloop engine and runs subcommands via `Process`.
 ///
-/// Resolution order (matches the brief):
-///   1. `<repo>/.venv/bin/dayloop`            (console-script launcher, if present)
-///   2. `<repo>/.venv/bin/python -m dayloop`  (module fallback)
+/// Resolution order:
+///   1. `$DAYLOOP_BIN`                        (hard executable override, cwd = repo)
+///   2. UserDefaults `enginePathKey`          (a repo dir, or an explicit binary)
+///   3. `<repo>/.venv/bin/dayloop`            (console-script launcher, if present)
+///   4. `<repo>/.venv/bin/python -m dayloop`  (module fallback)
 ///
-/// All work happens on a background queue supplied by the caller (see StatusStore);
-/// `run` itself blocks the calling thread until exit/timeout, so it must never be
+/// All blocking work happens on a background queue supplied by the caller (see
+/// StatusStore) or by `runAsync`; the blocking `run`/`runAction` must never be
 /// called on the main thread.
 struct DayloopClient {
     /// Absolute path to the executable we actually spawn.
@@ -41,31 +52,63 @@ struct DayloopClient {
 
     static let defaultRepo = URL(fileURLWithPath: "/Users/contains/projects/dayloop")
 
-    /// Build the default client by probing the venv for the console-script launcher.
-    static func resolveDefault(repo: URL = defaultRepo,
-                               environment: [String: String] = ProcessInfo.processInfo.environment) -> DayloopClient {
-        let launcher = repo.appendingPathComponent(".venv/bin/dayloop")
-        let python = repo.appendingPathComponent(".venv/bin/python")
+    /// Background queue backing `runAsync` so callers never block a thread pool.
+    private static let asyncQueue = DispatchQueue(label: "dayloop.action", qos: .userInitiated, attributes: .concurrent)
 
-        // Allow a hard override for the executable via env (used later by settings).
+    /// Build the default client, honouring env + the persisted engine path.
+    static func resolveDefault(repo defaultRepo: URL = DayloopClient.defaultRepo,
+                               environment: [String: String] = ProcessInfo.processInfo.environment,
+                               defaults: UserDefaults = .standard) -> DayloopClient {
+        let debug = resolveDebugLog(environment)
+        let fm = FileManager.default
+
+        // Determine the repo directory: a valid UserDefaults directory override,
+        // else the compiled-in default. A UserDefaults value pointing at an
+        // executable file is treated as an explicit binary instead.
+        var repo = defaultRepo
+        if let custom = defaults.string(forKey: DayloopDefaults.enginePathKey), !custom.isEmpty {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: custom, isDirectory: &isDir) {
+                if isDir.boolValue {
+                    repo = URL(fileURLWithPath: custom)
+                } else if fm.isExecutableFile(atPath: custom) {
+                    return DayloopClient(executable: URL(fileURLWithPath: custom),
+                                         baseArguments: [],
+                                         workingDirectory: repoGuess(forBinary: custom, fallback: defaultRepo),
+                                         debugLogPath: debug)
+                }
+            }
+        }
+
+        // A hard executable override still wins for *what* to run; cwd = repo.
         if let override = environment["DAYLOOP_BIN"], !override.isEmpty {
             return DayloopClient(executable: URL(fileURLWithPath: override),
                                  baseArguments: [],
                                  workingDirectory: repo,
-                                 debugLogPath: Self.resolveDebugLog(environment))
+                                 debugLogPath: debug)
         }
 
-        let fm = FileManager.default
+        let launcher = repo.appendingPathComponent(".venv/bin/dayloop")
+        let python = repo.appendingPathComponent(".venv/bin/python")
         if fm.isExecutableFile(atPath: launcher.path) {
             return DayloopClient(executable: launcher,
                                  baseArguments: [],
                                  workingDirectory: repo,
-                                 debugLogPath: Self.resolveDebugLog(environment))
+                                 debugLogPath: debug)
         }
         return DayloopClient(executable: python,
                              baseArguments: ["-m", "dayloop"],
                              workingDirectory: repo,
-                             debugLogPath: Self.resolveDebugLog(environment))
+                             debugLogPath: debug)
+    }
+
+    /// Guess the repo for an explicit binary at `<repo>/.venv/bin/<x>` (3 levels up).
+    private static func repoGuess(forBinary path: String, fallback: URL) -> URL {
+        let url = URL(fileURLWithPath: path)
+        let up = url.deletingLastPathComponent()   // .../.venv/bin
+            .deletingLastPathComponent()           // .../.venv
+            .deletingLastPathComponent()           // .../<repo>
+        return up.path.isEmpty || up.path == "/" ? fallback : up
     }
 
     private static func resolveDebugLog(_ env: [String: String]) -> String? {
@@ -81,9 +124,60 @@ struct DayloopClient {
         ([executable.path] + baseArguments).joined(separator: " ")
     }
 
-    /// Run `dayloop <args...>` and return raw stdout on success.
-    /// Blocking; call off the main thread. Enforces `timeout` by terminating the child.
+    // MARK: - Read: `status --json` etc. (non-empty stdout required)
+
+    /// Run `dayloop <args...>` and return raw stdout on success (must be non-empty).
+    /// Blocking; call off the main thread.
     func run(_ args: [String], timeout: TimeInterval = 5) -> Result<Data, DayloopError> {
+        switch execute(args, timeout: timeout) {
+        case .failure(let e):
+            return .failure(e)
+        case .success(let (status, out, err)):
+            if status != 0 {
+                return .failure(.nonZeroExit(status, String(data: err, encoding: .utf8) ?? ""))
+            }
+            if out.isEmpty {
+                log("empty output")
+                return .failure(.emptyOutput)
+            }
+            return .success(out)
+        }
+    }
+
+    // MARK: - Write: actions (exit 0 == success; stdout may be empty)
+
+    /// Run an arbitrary write/action subcommand. Success is a zero exit code;
+    /// stdout (returned trimmed) may legitimately be empty. Throws (as a Result
+    /// failure) on launch error, timeout, or non-zero exit. Blocking; off-main.
+    func runAction(_ args: [String], timeout: TimeInterval = 20) -> Result<String, DayloopError> {
+        switch execute(args, timeout: timeout) {
+        case .failure(let e):
+            return .failure(e)
+        case .success(let (status, out, err)):
+            if status != 0 {
+                return .failure(.nonZeroExit(status, String(data: err, encoding: .utf8) ?? ""))
+            }
+            let text = String(data: out, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return .success(text)
+        }
+    }
+
+    /// Async wrapper around `runAction` — runs the child on a background queue and
+    /// resumes the caller (e.g. a @MainActor context) when it exits.
+    func runAsync(_ args: [String], timeout: TimeInterval = 20) async -> Result<String, DayloopError> {
+        await withCheckedContinuation { continuation in
+            Self.asyncQueue.async {
+                continuation.resume(returning: runAction(args, timeout: timeout))
+            }
+        }
+    }
+
+    // MARK: - Core process runner (shared)
+
+    /// Launch the child, drain both pipes, enforce the timeout. Only fails for
+    /// launch/timeout; otherwise returns `(terminationStatus, stdout, stderr)`.
+    private func execute(_ args: [String], timeout: TimeInterval) -> Result<(Int32, Data, Data), DayloopError> {
         log("run: \(args.joined(separator: " "))")
 
         let process = Process()
@@ -102,8 +196,8 @@ struct DayloopClient {
         process.standardOutput = outPipe
         process.standardError = errPipe
 
-        // Drain both pipes concurrently so a full pipe buffer can never deadlock the
-        // child, regardless of output size.
+        // Drain both pipes concurrently so a full pipe buffer can never deadlock
+        // the child, regardless of output size.
         var outData = Data()
         var errData = Data()
         let ioGroup = DispatchGroup()
@@ -145,17 +239,8 @@ struct DayloopClient {
         ioGroup.wait()
 
         let status = process.terminationStatus
-        if status != 0 {
-            let msg = String(data: errData, encoding: .utf8) ?? ""
-            log("exit \(status): \(msg.prefix(200))")
-            return .failure(.nonZeroExit(status, msg))
-        }
-        if outData.isEmpty {
-            log("empty output")
-            return .failure(.emptyOutput)
-        }
-        log("ok: \(outData.count) bytes")
-        return .success(outData)
+        log("exit \(status): out \(outData.count)B err \(errData.count)B")
+        return .success((status, outData, errData))
     }
 
     // Append-only debug log; best-effort, never throws into the caller.

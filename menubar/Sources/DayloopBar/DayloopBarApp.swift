@@ -18,7 +18,21 @@ struct DayloopBarApp: App {
                 .onAppear { store.start() }
         }
         .menuBarExtraStyle(.window)
+
+        // A real Settings window, opened from the popover's gear menu via
+        // openWindow(id: "settings"). It shares the single StatusStore so writes
+        // and the live poll cadence stay in sync with the menu bar.
+        Window("Dayloop Settings", id: DayloopWindow.settings) {
+            SettingsView(store: store)
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
     }
+}
+
+/// Window identifiers used with `openWindow(id:)`.
+enum DayloopWindow {
+    static let settings = "settings"
 }
 
 /// Forces accessory activation (no Dock icon, no menu bar app menu) as a belt-and-

@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import SwiftUI
+import AppKit
 
 /// Overall health of the icon/UI, derived from the latest poll.
 enum BarState {
@@ -19,8 +20,16 @@ enum BarState {
     }
 }
 
-/// Polls `dayloop status --json` on a fixed cadence and publishes the decoded
-/// snapshot (or a human-readable error) for the SwiftUI views.
+/// A transient one-line result from a write action (success or failure), shown
+/// inline under the quick-actions row.
+struct ActionMessage: Equatable {
+    var text: String
+    var isError: Bool
+}
+
+/// Polls `dayloop status --json` on a (live-adjustable) cadence, decodes the
+/// snapshot, and runs write/action subcommands off the main thread, refreshing
+/// the snapshot after each successful write.
 @MainActor
 final class StatusStore: ObservableObject {
     @Published private(set) var status: DayloopStatus? = nil
@@ -28,10 +37,17 @@ final class StatusStore: ObservableObject {
     @Published private(set) var lastUpdated: Date? = nil
     @Published private(set) var isRefreshing: Bool = false
 
-    /// Poll cadence in seconds (advisory: `config.refresh_seconds` default 30).
-    let refreshSeconds: TimeInterval
+    /// Effective app settings from `config --json` (populated on start + Settings open).
+    @Published private(set) var config: DayloopConfig? = nil
+    /// Keys of write actions currently in flight (e.g. "today", "focus", "capture").
+    @Published private(set) var busyActions: Set<String> = []
+    /// The last write action's result, shown inline; auto-clears on the next action.
+    @Published var actionMessage: ActionMessage? = nil
 
-    private let client: DayloopClient
+    /// Poll cadence in seconds; live-adjustable from Settings.
+    @Published private(set) var refreshSeconds: TimeInterval
+
+    private var client: DayloopClient
     private let workQueue = DispatchQueue(label: "dayloop.status.poll", qos: .userInitiated)
     private var timer: Timer?
 
@@ -49,19 +65,20 @@ final class StatusStore: ObservableObject {
         return 30
     }
 
-    /// A description of the resolved engine invocation (shown in the footer / logs).
+    /// A description of the resolved engine invocation (shown in Settings / logs).
     var engineInvocation: String { client.invocationDescription }
+    /// The repo the engine runs in — used to open goals.md / reveal reports.
+    var repoURL: URL { client.workingDirectory }
+    /// The day the current snapshot summarizes (fallback: today, local).
+    var todayDate: String { status?.date ?? Self.isoDay(Date()) }
 
     // MARK: - Lifecycle
 
     func start() {
-        guard timer == nil else { return }   // idempotent: safe to call from multiple onAppear
+        guard timer == nil else { return }   // idempotent: safe from multiple onAppear
         refresh()
-        let t = Timer(timeInterval: refreshSeconds, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        loadConfig()
+        scheduleTimer()
     }
 
     func stop() {
@@ -69,7 +86,16 @@ final class StatusStore: ObservableObject {
         timer = nil
     }
 
-    // MARK: - Fetch
+    private func scheduleTimer() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: refreshSeconds, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    // MARK: - Fetch (status --json)
 
     func refresh() {
         guard !isRefreshing else { return }
@@ -104,6 +130,151 @@ final class StatusStore: ObservableObject {
         }
     }
 
+    /// Load `config --json` into `self.config` and sync the live poll cadence.
+    func loadConfig() {
+        Task {
+            let result = await client.runAsync(["config", "--json"], timeout: 8)
+            if case .success(let text) = result,
+               let data = text.data(using: .utf8),
+               let cfg = try? JSONDecoder().decode(DayloopConfig.self, from: data) {
+                self.config = cfg
+                self.applyRefreshCadence(TimeInterval(cfg.refreshSeconds))
+            }
+        }
+    }
+
+    // MARK: - Write actions
+
+    /// Run a write action off-main; on success optionally run `onSuccess`, set a
+    /// notice, and re-poll the engine. `key` de-dupes concurrent presses + drives
+    /// per-button spinners.
+    func perform(_ key: String,
+                 _ args: [String],
+                 timeout: TimeInterval = 20,
+                 notice: String? = nil,
+                 refreshAfter: Bool = true,
+                 onSuccess: ((String) -> Void)? = nil) {
+        guard !busyActions.contains(key) else { return }
+        busyActions.insert(key)
+        actionMessage = nil
+        Task {
+            let result = await client.runAsync(args, timeout: timeout)
+            self.busyActions.remove(key)
+            switch result {
+            case .success(let output):
+                onSuccess?(output)
+                if self.actionMessage == nil {
+                    let text = notice ?? output.split(separator: "\n").first.map(String.init) ?? "done"
+                    self.actionMessage = ActionMessage(text: text, isError: false)
+                }
+                if refreshAfter { self.refresh() }
+            case .failure(let err):
+                self.actionMessage = ActionMessage(text: err.description, isError: true)
+            }
+        }
+    }
+
+    // Intentions ---------------------------------------------------------------
+
+    func toggleIntention(_ id: String) {
+        perform("today", ["today", "toggle", id])
+    }
+
+    /// `parts` are already-trimmed non-empty intention strings (up to 3).
+    func setIntentions(_ parts: [String]) {
+        let joined = parts.prefix(3).joined(separator: "|")
+        perform("today", ["today", "set", joined], notice: "today's 3 set")
+    }
+
+    // Focus --------------------------------------------------------------------
+
+    func startFocus(goalId: String, minutes: Int) {
+        perform("focus", ["focus", "start", goalId, "--minutes", "\(minutes)"])
+    }
+
+    func stopFocus() {
+        perform("focus", ["focus", "stop"])
+    }
+
+    // Quick actions ------------------------------------------------------------
+
+    func captureNow() {
+        let date = todayDate
+        perform("capture", ["capture", date], timeout: 60, notice: "captured \(date)")
+    }
+
+    /// Generate the EOD report, then reveal the produced markdown in Finder.
+    func generateReport() {
+        let date = todayDate
+        // `report --backend` accepts only ollama|gemini; map "both" -> ollama.
+        let backend = (status?.health.backend.defaultBackend == "gemini") ? "gemini" : "ollama"
+        perform("report", ["report", date, "--backend", backend], timeout: 180,
+                notice: "EOD report ready") { [weak self] _ in
+            self?.revealReport(date: date)
+        }
+    }
+
+    func planDay() {
+        perform("plan", ["plan"], timeout: 60, notice: "plan generated")
+    }
+
+    // Config -------------------------------------------------------------------
+
+    func setConfig(_ key: String, _ value: String) {
+        perform("config", ["config", "set", key, value], notice: "\(key) = \(value)") { [weak self] _ in
+            self?.loadConfig()
+        }
+    }
+
+    /// Write `refresh_seconds` and update the live poll cadence immediately.
+    func setRefreshSeconds(_ n: Int) {
+        perform("config", ["config", "set", "refresh_seconds", "\(n)"],
+                notice: "refresh = \(n)s") { [weak self] _ in
+            self?.applyRefreshCadence(TimeInterval(n))
+            self?.loadConfig()
+        }
+    }
+
+    private func applyRefreshCadence(_ n: TimeInterval) {
+        guard n >= 1, n != refreshSeconds else { return }
+        refreshSeconds = n
+        if timer != nil { scheduleTimer() }   // reschedule at the new cadence
+    }
+
+    // Engine path (UserDefaults) -----------------------------------------------
+
+    /// Persist a new repo/binary path, rebuild the client, and re-poll.
+    func setEnginePath(_ path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: DayloopDefaults.enginePathKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: DayloopDefaults.enginePathKey)
+        }
+        client = .resolveDefault()
+        actionMessage = ActionMessage(text: "engine → \(client.invocationDescription)", isError: false)
+        refresh()
+        loadConfig()
+    }
+
+    func openGoalsFile() {
+        let url = repoURL.appendingPathComponent("goals.md")
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.open(url)
+        } else {
+            actionMessage = ActionMessage(text: "goals.md not found at \(url.path)", isError: true)
+        }
+    }
+
+    private func revealReport(date: String) {
+        let url = repoURL.appendingPathComponent("data/reports/\(date)-eod.md")
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            actionMessage = ActionMessage(text: "report ran but \(url.lastPathComponent) not found", isError: true)
+        }
+    }
+
     // MARK: - Derived UI state
 
     /// True when the freshest data is older than ~2 poll cycles, or an error stands.
@@ -114,10 +285,7 @@ final class StatusStore: ObservableObject {
     }
 
     var barState: BarState {
-        if let err = lastError, status == nil {
-            _ = err
-            return .off
-        }
+        if lastError != nil, status == nil { return .off }
         guard let s = status else { return .loading }
         if lastError != nil { return .off }
         return s.score.onTrack ? .onTrack : .drifting
@@ -125,7 +293,28 @@ final class StatusStore: ObservableObject {
 
     /// The number shown in the menu bar, or "--" when we have nothing.
     var scoreText: String {
-        guard let s = status, lastError == nil || status != nil else { return "--" }
+        guard let s = status else { return "--" }
         return "\(s.score.overall)"
+    }
+
+    // MARK: - Helpers
+
+    static func isoDay(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
+    }
+
+    /// Parse an ISO-8601 string, tolerating both offset and naive-local forms.
+    static func parseISO(_ s: String) -> Date? {
+        let withOffset = ISO8601DateFormatter()
+        withOffset.formatOptions = [.withInternetDateTime]
+        if let d = withOffset.date(from: s) { return d }
+        // Naive local (no offset), e.g. "2026-07-11T18:30:00".
+        let naive = DateFormatter()
+        naive.locale = Locale(identifier: "en_US_POSIX")
+        naive.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return naive.date(from: s)
     }
 }

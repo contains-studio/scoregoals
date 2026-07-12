@@ -345,6 +345,40 @@ struct ServiceStatus: Codable {
     }
 }
 
+// MARK: - config (`config --json`)
+
+/// The effective app-mutable settings, decoded from `dayloop config --json`.
+/// Equatable so the Settings view can react to fresh values arriving async.
+struct DayloopConfig: Codable, Equatable {
+    var defaultBackend: String = "ollama"
+    var nudgesEnabled: Bool = true
+    var capturePaused: Bool = false
+    var refreshSeconds: Int = 30
+    var ollamaUrl: String = ""
+    var geminiModel: String = ""
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case defaultBackend = "default_backend"
+        case nudgesEnabled = "nudges_enabled"
+        case capturePaused = "capture_paused"
+        case refreshSeconds = "refresh_seconds"
+        case ollamaUrl = "ollama_url"
+        case geminiModel = "gemini_model"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        defaultBackend = c.tolerant(String.self, .defaultBackend, "ollama")
+        nudgesEnabled = c.tolerant(Bool.self, .nudgesEnabled, true)
+        capturePaused = c.tolerant(Bool.self, .capturePaused, false)
+        refreshSeconds = c.tolerant(Int.self, .refreshSeconds, 30)
+        ollamaUrl = c.tolerant(String.self, .ollamaUrl, "")
+        geminiModel = c.tolerant(String.self, .geminiModel, "")
+    }
+}
+
 struct Backend: Codable {
     // `default` is a Swift keyword — mapped to `defaultBackend`.
     var defaultBackend: String = "ollama"
