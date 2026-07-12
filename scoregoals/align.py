@@ -44,7 +44,21 @@ __all__ = [
 MIN_ACTIVE_MINUTES = 30.0
 
 CONF_LABEL = 1.0
+CONF_SYSTEM = 0.95  # curated macOS system surfaces -> not_work, no review needed
 CONF_RULE = 0.9
+
+# macOS system surfaces that can never be "work": permission prompts, the lock
+# screen, the screensaver, window chrome. Sessions from these apps auto-resolve
+# to not_work (source "system") unless a user label says otherwise.
+SYSTEM_NOISE_APPS: frozenset = frozenset({
+    "UserNotificationCenter",
+    "loginwindow",
+    "ScreenSaverEngine",
+    "LockScreen",
+    "Dock",
+    "WindowServer",
+    "Window Server",
+})
 CONF_KEYWORD = 0.6
 CONF_KEYWORD_COLLISION = 0.4
 CONF_NONE = 0.2
@@ -100,6 +114,12 @@ def resolve_session(
     if label is not None:
         verdict = str(label.get("verdict"))
         source, confidence = "label", CONF_LABEL
+    elif (session.app or "").strip() in SYSTEM_NOISE_APPS:
+        # macOS system surfaces (permission prompts, the lock screen, the
+        # screensaver) are never "work" — learned the hard way when an overnight
+        # permission dialog booked 7.5 phantom hours. A user label still wins
+        # above; this settles the rest without review.
+        verdict, source, confidence = "not_work", "system", CONF_SYSTEM
     else:
         rule_verdict = _apply_rules(session, rules)
         if rule_verdict is not None:
@@ -121,9 +141,10 @@ def resolve_session(
         "goal_name": goal.name if goal else None,
         "source": source,
         "confidence": round(confidence, 2),
-        # High-authority signals (a user label or a promoted rule) are settled;
-        # keyword guesses and unmatched sessions surface for review.
-        "needs_review": source not in ("label", "rule"),
+        # High-authority signals (a user label, a promoted rule, or a known
+        # system surface) are settled; keyword guesses and unmatched sessions
+        # surface for review.
+        "needs_review": source not in ("label", "rule", "system"),
     }
 
 

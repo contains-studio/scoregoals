@@ -372,6 +372,21 @@ def cmd_label(args: argparse.Namespace) -> int:
 
     verdict_label = next((g.name for g in goals if g.id == verdict), verdict)
     print(f"labeled {sid} → {verdict_label}   score {_fmt_score(before)} -> {_fmt_score(after)}")
+
+    # Self-improvement runs on every correction, not on demand: quietly re-mine
+    # and report only when the rule set actually changed.
+    try:
+        res = learn_mod.mine(cfg, goals)
+        for r in res["promoted"]:
+            p = r["rule"]
+            tok = f" · title~{p['title_token']}" if p.get("title_token") else ""
+            print(f"learned: + {p['app']}{tok} → {p['verdict']}"
+                  f"  (from {len(r['created_from'])} consistent corrections)")
+        for r in res["retired"]:
+            p = r["rule"]
+            print(f"learned: - {p['app']} → {p['verdict']}  ({r.get('reason', 'retired')})")
+    except Exception as exc:  # a mining hiccup must never break labeling
+        print(f"warning: rule mining skipped ({exc})", file=sys.stderr)
     return 0
 
 
