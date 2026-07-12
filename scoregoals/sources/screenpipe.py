@@ -30,6 +30,10 @@ _PAGE_LIMIT = 1000
 # Cached result of `screenpipe auth token` for this process ("" = probed, none).
 _AUTO_TOKEN: str | None = None
 
+# content_types this server rejected with 400 (unsupported by its version);
+# skipped without warning for the rest of the process (e.g. 0.4.25 lacks "ui").
+_UNSUPPORTED: set[str] = set()
+
 
 def _warn(msg: str) -> None:
     print(f"[screenpipe] {msg}", file=sys.stderr)
@@ -142,6 +146,11 @@ def _fetch_content_type(
             "offset": offset,
         }
         resp = session.get(f"{base_url}/search", params=params, timeout=15)
+        if resp.status_code == 400:
+            # This server version doesn't support this content_type — skip it
+            # quietly from now on rather than warning on every poll.
+            _UNSUPPORTED.add(content_type)
+            return records
         if resp.status_code == 401:
             raise PermissionError(
                 "screenpipe API requires auth — set SCREENPIPE_API_KEY or run"
@@ -207,6 +216,8 @@ def fetch(start_iso: str, end_iso: str, config: Config) -> list[ActivityRecord]:
             if token:
                 session.headers["Authorization"] = f"Bearer {token}"
             for content_type in _CONTENT_TYPES:
+                if content_type in _UNSUPPORTED:
+                    continue
                 try:
                     records.extend(
                         _fetch_content_type(
