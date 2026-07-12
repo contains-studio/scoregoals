@@ -28,7 +28,11 @@ def check(config: Config) -> str | None:
     """
     from ..aggregate.segment import segment
     from ..compare import align
+    from ..focus import load as load_focus
     from ..sources import screenpipe
+
+    if not getattr(config, "nudges_enabled", True):  # app toggled nudges off
+        return None
 
     threshold = int(getattr(config, "nudge_threshold_min", 20) or 20)
     end = datetime.now().astimezone()
@@ -54,6 +58,17 @@ def check(config: Config) -> str | None:
     total = sum(s.minutes for s in sessions)
     if total <= 0:
         return None
+
+    # While a focus block is active AND recent activity is on the focus goal,
+    # stay quiet (you're heads-down on exactly what you chose).
+    focus = load_focus(config)
+    if focus.get("active") and focus.get("goal_id"):
+        focus_goal = next((g for g in goals if g.id == focus["goal_id"]), None)
+        if focus_goal:
+            fkeywords = [kw.lower().strip() for kw in focus_goal.keywords if kw.strip()]
+            focus_min = sum(s.minutes for s in sessions if _matches_any_goal(s, fkeywords))
+            if focus_min >= total * 0.5:
+                return None
 
     matched_min = sum(s.minutes for s in sessions if _matches_any_goal(s, keywords))
     # On track when at least half of the recent window aligns with some goal.

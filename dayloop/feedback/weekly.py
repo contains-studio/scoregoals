@@ -11,11 +11,13 @@ from ..models import DayTimeline, GoalAlignment
 
 
 def _default_backend(config: Config):
-    """Prefer the local ollama backend; use gemini only when config asks."""
-    name = "ollama"
-    raw = getattr(config, "raw", {}) or {}
-    if str(raw.get("default_backend", "")).lower() == "gemini":
-        name = "gemini"
+    """Prefer the local ollama backend; use gemini only when config asks.
+
+    Reads config.default_backend (the app-mutable setting); "both" still picks
+    the cheap local backend here since the synthesis wants a single narrative.
+    """
+    backend = str(getattr(config, "default_backend", "") or "").lower()
+    name = "gemini" if backend == "gemini" else "ollama"
     if name == "gemini":
         from ..analyze.gemini import GeminiBackend
 

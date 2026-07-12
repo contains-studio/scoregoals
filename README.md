@@ -49,7 +49,35 @@ python3 -m dayloop report  2026-07-11 --backend ollama   # -> data/reports/2026-
 ```
 
 All commands: `capture`, `analyze`, `report`, `plan`, `nudge`, `weekly`,
-`mock`, `doctor` — see `python3 -m dayloop --help`.
+`mock`, `status`, `today`, `focus`, `config`, `doctor` — see
+`python3 -m dayloop --help`. The `status`/`today`/`focus`/`config` commands are
+the machine-readable surface the menu bar app drives; their JSON is documented
+in `docs/STATUS_SCHEMA.md`.
+
+## Where the Ollama backend runs
+
+By default the Ollama backend runs **locally on this machine**
+(`ollama_url = http://localhost:11434` in `config.toml`) — this Mac is beefy
+enough to serve the model with no extra setup, so that's the default.
+
+It's a single config value, so you can offload inference to another box (e.g. a
+Mac Studio) over **Tailscale** without touching any code — point dayloop at the
+remote host's tailnet address:
+
+```sh
+export DAYLOOP_OLLAMA_URL=http://mac-studio.<tailnet>.ts.net:11434
+# or set ollama_url in config.toml
+```
+
+On that host, bind Ollama to the Tailscale interface and pull the model there:
+
+```sh
+OLLAMA_HOST=0.0.0.0 ollama serve
+ollama pull huihui_ai/qwen3-abliterated:4b-thinking-2507-fp16
+```
+
+Everything else (capture, aggregation, alignment, reports) still runs locally;
+only the model call is redirected.
 
 ## Layout
 

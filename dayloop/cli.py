@@ -12,6 +12,7 @@ requests etc. are imported lazily inside the source modules, never here).
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -33,12 +34,21 @@ def _cfg(args: argparse.Namespace) -> Config:
     return load_config(getattr(args, "config", None))
 
 
+def _print_json(obj) -> None:
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
 # --- subcommand handlers -----------------------------------------------------
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
     """capture <date>: build the timeline from all sources and store it."""
     cfg = _cfg(args)
+    if cfg.capture_paused and not getattr(args, "force", False):
+        # Honor the app's pause toggle: skip without touching existing data
+        # (duplicate-safe — any prior timeline for the date is left intact).
+        print(f"capture paused (settings capture_paused=true) — skipping {args.date}")
+        return 0
     from .aggregate import timeline as timeline_mod
     from .store import save_timeline
 
@@ -172,6 +182,199 @@ def cmd_mock(args: argparse.Namespace) -> int:
         f" github={len(tl.github)} meetings={len(tl.meetings)}"
     )
     print(f"  total_active_minutes={stats.get('total_active_minutes')}")
+    return 0
+
+
+# --- status / today / focus / config (menu bar app surface) ------------------
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """status [--json] [--date]: one live JSON snapshot for the app (exit 0)."""
+    cfg = _cfg(args)
+    from . import status as status_mod
+
+    d = getattr(args, "date", None) or _today()
+    print(status_mod.build_json(cfg, d))
+    return 0
+
+
+def _today_date(args: argparse.Namespace) -> str:
+    return getattr(args, "date", None) or _today()
+
+
+def cmd_today_show(args: argparse.Namespace) -> int:
+    """today [--json]: intentions with time attributed to each from today."""
+    cfg = _cfg(args)
+    from . import intentions
+
+    d = _today_date(args)
+    block = intentions.block(cfg, d)
+    if getattr(args, "json", False):
+        _print_json(block)
+        return 0
+
+    print(f"dayloop — intentions for {d}")
+    if block.get("set_at"):
+        print(f"  set {block['set_at']}")
+    items = block["items"]
+    if not items:
+        print('  (none yet — set with: dayloop today set "a|b|c")')
+        return 0
+    for i, it in enumerate(items, 1):
+        mark = "x" if it["done"] else " "
+        goal = f"  → {it['goal_name']}" if it.get("goal_name") else "  (no goal)"
+        attr = f"  [{it['attributed_minutes']:.0f}m today]" if it.get("attributed_minutes") else ""
+        print(f"  {i}. [{mark}] {it['text']}{goal}{attr}")
+        if it.get("apps"):
+            print(f"        apps: {', '.join(it['apps'])}")
+    return 0
+
+
+def cmd_today_set(args: argparse.Namespace) -> int:
+    """today set "a|b|c": replace with up to 3 auto-linked intentions."""
+    cfg = _cfg(args)
+    from . import intentions
+
+    d = _today_date(args)
+    texts = [t.strip() for t in args.items.split("|")]
+    rec = intentions.set_items(cfg, d, texts)
+    print(f"set {len(rec['items'])} intention(s) for {d}:")
+    for i, it in enumerate(rec["items"], 1):
+        goal = f" → {it['goal_id']}" if it.get("goal_id") else " (no goal match)"
+        print(f"  {i}. {it['text']}{goal}")
+    return 0
+
+
+def cmd_today_add(args: argparse.Namespace) -> int:
+    """today add "text" [--goal ID]: append one intention."""
+    cfg = _cfg(args)
+    from . import intentions
+
+    d = _today_date(args)
+    try:
+        rec = intentions.add_item(cfg, d, args.text, goal_id=getattr(args, "goal", None))
+    except ValueError as exc:
+        print(f"dayloop: {exc}", file=sys.stderr)
+        return 2
+    it = rec["items"][-1]
+    goal = f" → {it['goal_id']}" if it.get("goal_id") else " (no goal match)"
+    print(f"added: {it['text']}{goal}")
+    return 0
+
+
+def cmd_today_toggle(args: argparse.Namespace) -> int:
+    """today toggle <id-or-index>: flip an intention's done flag."""
+    cfg = _cfg(args)
+    from . import intentions
+
+    d = _today_date(args)
+    it = intentions.toggle(cfg, d, args.ref)
+    if it is None:
+        print(f"dayloop: no intention matching {args.ref!r}", file=sys.stderr)
+        return 2
+    print(f"{'done' if it['done'] else 'reopened'}: {it['text']}")
+    return 0
+
+
+def cmd_today_clear(args: argparse.Namespace) -> int:
+    """today clear: remove all of today's intentions."""
+    cfg = _cfg(args)
+    from . import intentions
+
+    d = _today_date(args)
+    intentions.clear(cfg, d)
+    print(f"cleared intentions for {d}")
+    return 0
+
+
+def cmd_focus_show(args: argparse.Namespace) -> int:
+    """focus [--json]: show the active focus block, if any."""
+    cfg = _cfg(args)
+    from . import focus
+
+    block = focus.load(cfg)
+    if getattr(args, "json", False):
+        _print_json(block)
+        return 0
+    if not block["active"]:
+        print("focus: none active")
+        return 0
+    until = f" until {block['until']}" if block.get("until") else " (open-ended)"
+    print(f"focus: {block['goal_name']} ({block['goal_id']}){until}; started {block['started_at']}")
+    return 0
+
+
+def cmd_focus_start(args: argparse.Namespace) -> int:
+    """focus start <goal> [--minutes N]: begin a focus block."""
+    cfg = _cfg(args)
+    from . import focus
+
+    block = focus.start(cfg, args.goal, minutes=getattr(args, "minutes", None))
+    if block.get("until"):
+        tail = f" for {args.minutes}m (until {block['until']})"
+    else:
+        tail = " (open-ended)"
+    print(f"focus started: {block['goal_name']} ({block['goal_id']}){tail}")
+    return 0
+
+
+def cmd_focus_stop(args: argparse.Namespace) -> int:
+    """focus stop: end the active focus block."""
+    cfg = _cfg(args)
+    from . import focus
+
+    focus.stop(cfg)
+    print("focus stopped")
+    return 0
+
+
+def cmd_config_show(args: argparse.Namespace) -> int:
+    """config [--json]: effective app-mutable settings."""
+    cfg = _cfg(args)
+    from .config import effective_settings
+
+    eff = effective_settings(cfg)
+    if getattr(args, "json", False):
+        _print_json(eff)
+        return 0
+    for k, v in eff.items():
+        print(f"{k} = {json.dumps(v)}")
+    return 0
+
+
+def cmd_config_get(args: argparse.Namespace) -> int:
+    """config get <key>: print one setting's effective value."""
+    cfg = _cfg(args)
+    from .config import SETTINGS_KEYS, get_setting
+
+    try:
+        v = get_setting(cfg, args.key)
+    except KeyError:
+        print(
+            f"dayloop: unknown config key {args.key!r}; valid: {', '.join(SETTINGS_KEYS)}",
+            file=sys.stderr,
+        )
+        return 2
+    print("true" if v is True else "false" if v is False else v)
+    return 0
+
+
+def cmd_config_set(args: argparse.Namespace) -> int:
+    """config set <key> <value>: persist one setting to data/settings.json."""
+    cfg = _cfg(args)
+    from .config import SETTINGS_KEYS, get_setting, set_setting
+
+    try:
+        set_setting(cfg, args.key, args.value)
+    except KeyError:
+        print(
+            f"dayloop: unknown config key {args.key!r}; settable: {', '.join(SETTINGS_KEYS)}",
+            file=sys.stderr,
+        )
+        return 2
+    reloaded = _cfg(args)
+    v = get_setting(reloaded, args.key)
+    print(f"{args.key} = {json.dumps(v)} (saved to {reloaded.settings_path})")
     return 0
 
 
@@ -355,6 +558,54 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("mock", help="write a deterministic mock timeline (test without screenpipe)")
     p.add_argument("--date", metavar="YYYY-MM-DD", help="default: today")
     p.set_defaults(func=cmd_mock)
+
+    p = sub.add_parser("status", help="live JSON snapshot for the menu bar app (never crashes)")
+    p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p.add_argument("--date", metavar="YYYY-MM-DD", help="default: today")
+    p.set_defaults(func=cmd_status)
+
+    # today — daily intentions -------------------------------------------------
+    p_today = sub.add_parser("today", help="daily intentions (up to 3, time-attributed)")
+    p_today.add_argument("--json", action="store_true", help="print the intentions block as JSON")
+    p_today.set_defaults(func=cmd_today_show, today_action=None)
+    today_sub = p_today.add_subparsers(dest="today_action", metavar="action")
+    q = today_sub.add_parser("set", help='replace intentions from "a|b|c" (up to 3)')
+    q.add_argument("items", metavar='"a|b|c"', help="pipe-separated intentions")
+    q.set_defaults(func=cmd_today_set)
+    q = today_sub.add_parser("add", help="append one intention")
+    q.add_argument("text", help="intention text")
+    q.add_argument("--goal", metavar="ID", help="link to a specific goal id")
+    q.set_defaults(func=cmd_today_add)
+    q = today_sub.add_parser("toggle", help="flip done by intention id or 1-based index")
+    q.add_argument("ref", help="intention id or 1-based index")
+    q.set_defaults(func=cmd_today_toggle)
+    q = today_sub.add_parser("clear", help="remove all of today's intentions")
+    q.set_defaults(func=cmd_today_clear)
+
+    # focus — focus blocks -----------------------------------------------------
+    p_focus = sub.add_parser("focus", help="focus block (suppresses nudges while on-goal)")
+    p_focus.add_argument("--json", action="store_true", help="print the focus block as JSON")
+    p_focus.set_defaults(func=cmd_focus_show, focus_action=None)
+    focus_sub = p_focus.add_subparsers(dest="focus_action", metavar="action")
+    q = focus_sub.add_parser("start", help="start a focus block on a goal id or name")
+    q.add_argument("goal", help="goal id or name")
+    q.add_argument("--minutes", type=int, metavar="N", help="auto-expire after N minutes")
+    q.set_defaults(func=cmd_focus_start)
+    q = focus_sub.add_parser("stop", help="stop the active focus block")
+    q.set_defaults(func=cmd_focus_stop)
+
+    # config — app-mutable settings overlay ------------------------------------
+    p_config = sub.add_parser("config", help="read/write app-mutable settings (data/settings.json)")
+    p_config.add_argument("--json", action="store_true", help="print effective settings as JSON")
+    p_config.set_defaults(func=cmd_config_show, config_action=None)
+    config_sub = p_config.add_subparsers(dest="config_action", metavar="action")
+    q = config_sub.add_parser("get", help="print one setting's effective value")
+    q.add_argument("key", help="setting key")
+    q.set_defaults(func=cmd_config_get)
+    q = config_sub.add_parser("set", help="write one setting to data/settings.json")
+    q.add_argument("key", help="setting key")
+    q.add_argument("value", help="new value")
+    q.set_defaults(func=cmd_config_set)
 
     p = sub.add_parser("doctor", help="check external tools + services, print a checklist")
     p.set_defaults(func=cmd_doctor)

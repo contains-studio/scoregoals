@@ -150,6 +150,40 @@ def _match_session(s: Session, goals: list[Goal]) -> str | None:
     return best_id
 
 
+def match_text(text: str, goals: list[Goal]) -> str | None:
+    """Public: id of the goal whose keywords best match arbitrary text (most
+    distinct keyword hits wins; ties break by goals order), or None. Uses the
+    same whole-word-ish keyword logic as session alignment, so `status` "now"
+    mapping and intention auto-linking stay consistent with the day score."""
+    hay = (text or "").lower()
+    if not hay:
+        return None
+    best_id: str | None = None
+    best_hits = 0
+    for g in goals:
+        hits = _keyword_hits(g.keywords, hay)
+        if hits > best_hits:
+            best_id, best_hits = g.id, hits
+    return best_id
+
+
+def attribute_sessions(timeline: DayTimeline, goals: list[Goal]) -> dict[str, dict]:
+    """Attribute each session's minutes and distinct apps to a goal id (same
+    at-most-one matching as align()). Returns {goal_id: {"minutes", "apps"}},
+    with unmatched time under UNALIGNED_ID. Used to compute per-intention
+    attributed_minutes/apps without recomputing alignment elsewhere."""
+    out: dict[str, dict] = {}
+    for s in timeline.sessions:
+        gid = _match_session(s, goals) or UNALIGNED_ID
+        entry = out.setdefault(gid, {"minutes": 0.0, "apps": []})
+        entry["minutes"] += s.minutes
+        if s.app and s.app not in entry["apps"]:
+            entry["apps"].append(s.app)
+    for entry in out.values():
+        entry["minutes"] = round(entry["minutes"], 1)
+    return out
+
+
 def _total_minutes(timeline: DayTimeline) -> float:
     total = timeline.stats.get("total_active_minutes") if isinstance(timeline.stats, dict) else None
     if isinstance(total, (int, float)) and total > 0:

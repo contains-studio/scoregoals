@@ -13,12 +13,25 @@ Env overrides (always win over config.toml):
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["Config", "load_config", "default_config", "DEFAULTS"]
+__all__ = [
+    "Config",
+    "load_config",
+    "default_config",
+    "DEFAULTS",
+    "SETTINGS_KEYS",
+    "SETTINGS_FILENAME",
+    "load_settings",
+    "set_setting",
+    "get_setting",
+    "effective_settings",
+]
 
 DEFAULTS: dict = {
     "data_dir": "./data",
@@ -32,6 +45,11 @@ DEFAULTS: dict = {
     "github_user": "mgalpert",
     "nudge_threshold_min": 20,
     "icloud_mirror": "",  # empty = off
+    # --- app-mutable runtime settings (menu bar app writes these) ------------
+    "default_backend": "ollama",  # ollama | gemini | both
+    "nudges_enabled": True,       # nudge honors this
+    "capture_paused": False,      # capture honors this (skips when true)
+    "refresh_seconds": 30,        # app poll cadence (advisory; used by the app)
 }
 
 _ENV_OVERRIDES: dict[str, str] = {
@@ -41,7 +59,61 @@ _ENV_OVERRIDES: dict[str, str] = {
     "DAYLOOP_OLLAMA_MODEL": "ollama_model",
     "DAYLOOP_GEMINI_MODEL": "gemini_model",
     "DAYLOOP_ICLOUD_MIRROR": "icloud_mirror",
+    "DAYLOOP_DEFAULT_BACKEND": "default_backend",
+    "DAYLOOP_NUDGES_ENABLED": "nudges_enabled",
+    "DAYLOOP_CAPTURE_PAUSED": "capture_paused",
+    "DAYLOOP_REFRESH_SECONDS": "refresh_seconds",
 }
+
+# JSON overlay file (under data_dir) the app can write to mutate settings without
+# touching config.toml. Precedence: DEFAULTS < config.toml < settings.json < env.
+SETTINGS_FILENAME = "settings.json"
+
+# Keys the app is allowed to read/write through `dayloop config`. Each maps to
+# the coercion applied to string inputs (from `config set` / env vars).
+SETTINGS_KEYS: dict[str, str] = {
+    "default_backend": "backend",  # ollama | gemini | both
+    "nudges_enabled": "bool",
+    "capture_paused": "bool",
+    "refresh_seconds": "int",
+    "ollama_url": "str",
+    "gemini_model": "str",
+}
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(float(value))  # tolerate "30", "30.0", 30.0
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_backend(value: object) -> str:
+    v = str(value).strip().lower()
+    return v if v in ("ollama", "gemini", "both") else "ollama"
+
+
+def coerce_setting(key: str, value: object):
+    """Coerce a raw (possibly string) value to the type `key` expects."""
+    kind = SETTINGS_KEYS.get(key)
+    if kind == "bool" or key in ("nudges_enabled", "capture_paused"):
+        return _as_bool(value)
+    if kind == "int" or key in ("refresh_seconds", "nudge_threshold_min"):
+        return _as_int(value, int(DEFAULTS.get(key, 0) or 0))
+    if kind == "backend" or key == "default_backend":
+        return _as_backend(value)
+    if key in ("gemini_price_in_per_1m", "gemini_price_out_per_1m"):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(DEFAULTS.get(key, 0.0) or 0.0)
+    return str(value)
 
 
 @dataclass
@@ -66,6 +138,13 @@ class Config:
     github_user: str
     nudge_threshold_min: int
     icloud_mirror: str
+    # app-mutable runtime settings (see SETTINGS_KEYS); all have safe defaults so
+    # older callers that build Config without them keep working.
+    default_backend: str = "ollama"
+    nudges_enabled: bool = True
+    capture_paused: bool = False
+    refresh_seconds: int = 30
+    settings_path: str = ""  # absolute path to data/settings.json
     raw: dict = field(default_factory=dict)  # the parsed config.toml, verbatim
 
 
@@ -85,10 +164,30 @@ def _find_config_file(explicit: str | None) -> Path | None:
     return None
 
 
-def _build(values: dict, raw: dict, base: Path) -> Config:
+def _apply_env(values: dict) -> None:
     for env_key, cfg_key in _ENV_OVERRIDES.items():
         if os.environ.get(env_key):
             values[cfg_key] = os.environ[env_key]
+
+
+def load_settings(data_dir: str | Path) -> dict:
+    """Read the data/settings.json overlay -> dict. Missing or invalid file
+    (bad JSON, not an object) yields {} with a one-line stderr warning; never
+    raises, so a corrupt overlay can't take the whole CLI down."""
+    path = Path(data_dir) / SETTINGS_FILENAME
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[dayloop.config] warning: ignoring bad {path} ({exc})", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _build(values: dict, raw: dict, base: Path) -> Config:
+    # Env first so DAYLOOP_DATA_DIR is honored when locating settings.json.
+    _apply_env(values)
 
     data_dir = Path(str(values["data_dir"])).expanduser()
     if not data_dir.is_absolute():
@@ -100,6 +199,14 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
     benchmarks_dir = data_dir / "benchmarks"
     for d in (data_dir, timeline_dir, reports_dir, benchmarks_dir):
         d.mkdir(parents=True, exist_ok=True)
+
+    # settings.json overlay: sits above config.toml, below env. data_dir itself
+    # is never relocated from the overlay (the file lives inside data_dir).
+    for k, v in load_settings(data_dir).items():
+        if k in DEFAULTS and k != "data_dir":
+            values[k] = v
+    # Re-apply env so it wins over the overlay.
+    _apply_env(values)
 
     goals_path = Path(str(raw.get("goals_path") or (base / "goals.md"))).expanduser()
 
@@ -122,8 +229,48 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
         github_user=str(values["github_user"]),
         nudge_threshold_min=int(values["nudge_threshold_min"]),
         icloud_mirror=str(values["icloud_mirror"]),
+        default_backend=_as_backend(values["default_backend"]),
+        nudges_enabled=_as_bool(values["nudges_enabled"]),
+        capture_paused=_as_bool(values["capture_paused"]),
+        refresh_seconds=_as_int(values["refresh_seconds"], 30),
+        settings_path=str(data_dir / SETTINGS_FILENAME),
         raw=raw,
     )
+
+
+def effective_settings(config: Config) -> dict:
+    """The effective (merged) values of the app-mutable settings — exactly the
+    keys `dayloop config` exposes, in a stable order."""
+    return {
+        "default_backend": config.default_backend,
+        "nudges_enabled": config.nudges_enabled,
+        "capture_paused": config.capture_paused,
+        "refresh_seconds": config.refresh_seconds,
+        "ollama_url": config.ollama_url,
+        "gemini_model": config.gemini_model,
+    }
+
+
+def get_setting(config: Config, key: str):
+    """Return the effective value of one app-mutable setting."""
+    if key not in SETTINGS_KEYS:
+        raise KeyError(key)
+    return effective_settings(config)[key]
+
+
+def set_setting(config: Config, key: str, value: object) -> dict:
+    """Coerce and persist one app-mutable setting into data/settings.json
+    (merging with whatever is already there). Returns the new overlay dict.
+    Raises KeyError for unknown keys."""
+    if key not in SETTINGS_KEYS:
+        raise KeyError(key)
+    coerced = coerce_setting(key, value)
+    path = Path(config.settings_path or (Path(config.data_dir) / SETTINGS_FILENAME))
+    overlay = load_settings(config.data_dir)
+    overlay[key] = coerced
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(overlay, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return overlay
 
 
 def load_config(path: str | None = None) -> Config:

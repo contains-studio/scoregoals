@@ -11,11 +11,13 @@ from ..models import ActivityRecord, DayTimeline
 
 
 def _default_backend(config: Config):
-    """Prefer the local ollama backend; use gemini only when config asks."""
-    name = "ollama"
-    raw = getattr(config, "raw", {}) or {}
-    if str(raw.get("default_backend", "")).lower() == "gemini":
-        name = "gemini"
+    """Prefer the local ollama backend; use gemini only when config asks.
+
+    Reads config.default_backend (the app-mutable setting); "both" still picks
+    the cheap local backend here since the plan wants a single narrative.
+    """
+    backend = str(getattr(config, "default_backend", "") or "").lower()
+    name = "gemini" if backend == "gemini" else "ollama"
     if name == "gemini":
         from ..analyze.gemini import GeminiBackend
 
@@ -126,6 +128,28 @@ def generate(date: str, config: Config) -> str:
     else:
         lines.append("- No goals configured yet — add some to goals.md.")
     lines.append("")
+
+    # Seed today's intentions from the plan — only when none are set yet, so a
+    # manual `today set` earlier in the day is never clobbered.
+    try:
+        from .. import intentions as intentions_mod
+
+        if suggestions:
+            prefill_texts = [s for s in suggestions if s.strip()][:3]
+        else:
+            prefill_texts = []
+            seen: set[str] = set()
+            for a in sorted(alignments, key=lambda a: a.pct_time):
+                if a.goal_id == "unaligned" or a.goal_name in seen:
+                    continue
+                seen.add(a.goal_name)
+                prefill_texts.append(f"Make progress on {a.goal_name}")
+                if len(prefill_texts) >= 3:
+                    break
+        if prefill_texts:
+            intentions_mod.prefill(config, date, prefill_texts, goals=goals)
+    except Exception as exc:  # intentions are a nicety — never fail the plan
+        print(f"warning: could not pre-fill intentions ({exc})", file=sys.stderr)
 
     lines.append("---")
     lines.append(f"_source {backend_label}_")
