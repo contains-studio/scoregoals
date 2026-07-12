@@ -195,6 +195,100 @@ def _fetch_content_type(
     return records
 
 
+def search(
+    query: str,
+    config: Config,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+    types: tuple[str, ...] = ("ocr", "audio", "ui"),
+    limit: int = 20,
+) -> dict:
+    """Proxy screenpipe's GET /search for a free-text `query`.
+
+    Reuses the same Bearer-token resolution, hit normalization, and _UNSUPPORTED
+    handling as fetch(). Returns a dict::
+
+        {"records": [ActivityRecord, ...], "error": str | None}
+
+    `error` is a short string when screenpipe is unreachable / requests missing /
+    auth is rejected (records is then []); the caller turns that into the
+    documented ``{"error": "screenpipe unreachable", ...}`` envelope. `types`
+    selects which content_types to query (unsupported ones are skipped). Results
+    across content types are merged and truncated to `limit`.
+    """
+    try:
+        import requests  # lazy, per HARD rules
+    except ImportError:
+        _warn("requests not installed; returning no records")
+        return {"records": [], "error": "requests not installed"}
+
+    base_url = config.screenpipe_url.rstrip("/")
+    token = _resolve_token(config)
+    want = [t for t in types if t in _CONTENT_TYPES]
+    per_type_limit = max(1, int(limit))
+    records: list[ActivityRecord] = []
+    error: str | None = None
+
+    try:
+        with requests.Session() as session:
+            if token:
+                session.headers["Authorization"] = f"Bearer {token}"
+            for content_type in want:
+                if content_type in _UNSUPPORTED:
+                    continue
+                params = {
+                    "content_type": content_type,
+                    "q": query,
+                    "limit": per_type_limit,
+                    "offset": 0,
+                }
+                if start_iso:
+                    params["start_time"] = start_iso
+                if end_iso:
+                    params["end_time"] = end_iso
+                try:
+                    resp = session.get(f"{base_url}/search", params=params, timeout=15)
+                except requests.exceptions.ConnectionError:
+                    error = "screenpipe unreachable"
+                    break
+                if resp.status_code == 400:
+                    _UNSUPPORTED.add(content_type)
+                    continue
+                if resp.status_code == 401:
+                    error = "screenpipe auth rejected"
+                    _warn(
+                        "screenpipe API requires auth — set SCREENPIPE_API_KEY or run"
+                        " `screenpipe auth token` (auto-detection failed)"
+                    )
+                    break
+                try:
+                    resp.raise_for_status()
+                    payload = resp.json()
+                except (requests.exceptions.RequestException, ValueError) as exc:
+                    _warn(f"search {content_type} failed: {exc.__class__.__name__}")
+                    continue
+
+                if isinstance(payload, dict):
+                    data = payload.get("data")
+                    if data is None:
+                        data = payload.get("results", [])
+                elif isinstance(payload, list):
+                    data = payload
+                else:
+                    data = []
+                if not isinstance(data, list):
+                    data = []
+                for hit in data:
+                    rec = _record_from_hit(hit, _CONTENT_TYPES[content_type])
+                    if rec is not None:
+                        records.append(rec)
+    except requests.exceptions.RequestException as exc:
+        _warn(f"unreachable at {base_url}: {exc}")
+        return {"records": [], "error": "screenpipe unreachable"}
+
+    return {"records": records[: int(limit)], "error": error}
+
+
 def fetch(start_iso: str, end_iso: str, config: Config) -> list[ActivityRecord]:
     """Fetch screenpipe records in [start_iso, end_iso) as ActivityRecords.
 

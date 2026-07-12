@@ -783,6 +783,96 @@ def cmd_goals_write(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- agent-facing readers (timeline / search / labels / rules / bench /
+#     reports / trend) — clean JSON for Michael's "check on me" agent ---------
+
+
+def cmd_timeline(args: argparse.Namespace) -> int:
+    """timeline [--date D] --json: the full stored DayTimeline (heal path)."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    d = getattr(args, "date", None) or _today()
+    _print_json(agentapi.timeline_payload(cfg, d))
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """search "<query>": proxy screenpipe /search, redacting every text field."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    _print_json(
+        agentapi.search_payload(
+            cfg,
+            args.query,
+            getattr(args, "from_", None),
+            getattr(args, "to", None),
+            getattr(args, "limit", None) or 20,
+            getattr(args, "type", None) or "all",
+        )
+    )
+    return 0
+
+
+def cmd_labels(args: argparse.Namespace) -> int:
+    """labels [--date D | --days N] --json: the parsed corrections log."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    _print_json(
+        agentapi.labels_payload(cfg, getattr(args, "date", None), getattr(args, "days", None))
+    )
+    return 0
+
+
+def cmd_rules(args: argparse.Namespace) -> int:
+    """rules --json: active + retired learned rules with created_from counts."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    _print_json(agentapi.rules_payload(cfg))
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    """bench [--days N] --json: parsed benchmarks/compare.csv rows."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    _print_json(agentapi.bench_payload(cfg, getattr(args, "days", None)))
+    return 0
+
+
+def cmd_reports_list(args: argparse.Namespace) -> int:
+    """reports list --json: every available report (db rows + md-only)."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    _print_json(agentapi.reports_list_payload(cfg))
+    return 0
+
+
+def cmd_reports_show(args: argparse.Namespace) -> int:
+    """reports show <date> [--kind eod|weekly] --json: one stored report."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    kind = getattr(args, "kind", None) or "eod"
+    _print_json(agentapi.report_show_payload(cfg, args.date, kind))
+    return 0
+
+
+def cmd_trend(args: argparse.Namespace) -> int:
+    """trend [--days N] --json: per-day score/minutes/goals/corrections."""
+    cfg = _cfg(args)
+    from . import agentapi
+
+    days = getattr(args, "days", None) or 14
+    _print_json(agentapi.trend_payload(cfg, days))
+    return 0
+
+
 # --- doctor (FULLY IMPLEMENTED) ----------------------------------------------
 
 
@@ -1140,6 +1230,56 @@ def build_parser() -> argparse.ArgumentParser:
     q = goals_sub.add_parser("unarchive", help="reactivate an archived goal by id")
     q.add_argument("goal_id", metavar="GOAL-ID", help="goal slug id (see `scoregoals goals`)")
     q.set_defaults(func=cmd_goals_unarchive)
+
+    # agent-facing readers (Michael's "check on me" agent) --------------------
+    p = sub.add_parser("timeline", help="the full stored DayTimeline for a date (JSON)")
+    p.add_argument("--date", metavar="YYYY-MM-DD", help="default: today")
+    p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p.set_defaults(func=cmd_timeline)
+
+    p = sub.add_parser("search", help="proxy screenpipe /search (redacted OCR/audio/ui rows)")
+    p.add_argument("query", metavar="QUERY", help="free-text query")
+    p.add_argument("--from", dest="from_", metavar="ISO", help="start time (ISO-8601)")
+    p.add_argument("--to", metavar="ISO", help="end time (ISO-8601)")
+    p.add_argument("--limit", type=int, metavar="N", default=20, help="max rows (default 20)")
+    p.add_argument("--type", choices=["ocr", "audio", "all"], default="all",
+                   help="content type to search (default all)")
+    p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("labels", help="the parsed corrections log (labels.jsonl)")
+    grp = p.add_mutually_exclusive_group()
+    grp.add_argument("--date", metavar="YYYY-MM-DD", help="only labels for this day")
+    grp.add_argument("--days", type=int, metavar="N", help="labels in the N-day window ending today")
+    p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p.set_defaults(func=cmd_labels)
+
+    p = sub.add_parser("rules", help="learned rules: active + retired (created_from counts)")
+    p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p.set_defaults(func=cmd_rules)
+
+    p = sub.add_parser("bench", help="parsed benchmark rows (benchmarks/compare.csv)")
+    p.add_argument("--days", type=int, metavar="N", help="rows in the N-day window ending today")
+    p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p.set_defaults(func=cmd_bench)
+
+    p_reports = sub.add_parser("reports", help="stored reports (db + markdown)")
+    p_reports.set_defaults(func=cmd_reports_list)  # bare `reports` -> list
+    reports_sub = p_reports.add_subparsers(dest="reports_action", metavar="action")
+    q = reports_sub.add_parser("list", help="every available report (JSON)")
+    q.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    q.set_defaults(func=cmd_reports_list)
+    q = reports_sub.add_parser("show", help="one stored report by date")
+    q.add_argument("date", metavar="YYYY-MM-DD", help="report date")
+    q.add_argument("--kind", choices=["eod", "weekly", "morning"], default="eod",
+                   help="report kind (default eod)")
+    q.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    q.set_defaults(func=cmd_reports_show)
+
+    p = sub.add_parser("trend", help="per-day score/minutes/goals/corrections (default 14 days)")
+    p.add_argument("--days", type=int, metavar="N", default=14, help="days to include (default 14)")
+    p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p.set_defaults(func=cmd_trend)
 
     p = sub.add_parser("doctor", help="check external tools + services, print a checklist")
     p.set_defaults(func=cmd_doctor)

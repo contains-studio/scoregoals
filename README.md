@@ -65,10 +65,16 @@ bring-your-own-key (optional); set it during setup or later with
 `.venv/bin/python -m scoregoals config set gemini_api_key <key>`.
 
 All commands: `capture`, `analyze`, `report`, `plan`, `nudge`, `weekly`,
-`mock`, `status`, `today`, `focus`, `config`, `doctor` — see
-`python3 -m scoregoals --help`. The `status`/`today`/`focus`/`config` commands are
-the machine-readable surface the menu bar app drives; their JSON is documented
-in `docs/STATUS_SCHEMA.md`.
+`mock`, `status`, `today`, `focus`, `config`, `review`, `label`, `learn`,
+`goals`, `timeline`, `search`, `labels`, `rules`, `bench`, `reports`, `trend`,
+`doctor` — see `python3 -m scoregoals --help`. The `status`/`today`/`focus`/`config`
+commands are the machine-readable surface the menu bar app drives; their JSON is
+documented in `docs/STATUS_SCHEMA.md`.
+
+The read-only `timeline`/`search`/`labels`/`rules`/`bench`/`reports`/`trend`
+commands (plus `status`/`review`) are the **agent-facing API**: everything an
+automated "check on me" agent needs to reach every piece of stored data as clean
+`--json`. That surface is documented in **[docs/AGENT_API.md](docs/AGENT_API.md)**.
 
 ## Where the Ollama backend runs
 
