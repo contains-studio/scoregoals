@@ -39,6 +39,10 @@ final class StatusStore: ObservableObject {
 
     /// Effective app settings from `config --json` (populated on start + Settings open).
     @Published private(set) var config: DayloopConfig? = nil
+    /// Whether a Gemini API key is stored (BYOK). Loaded via `config get
+    /// gemini_api_key`, which prints only "set"/"not set" — the key value is
+    /// never read into the app.
+    @Published private(set) var geminiKeyIsSet: Bool = false
     /// Keys of write actions currently in flight (e.g. "today", "focus", "capture").
     @Published private(set) var busyActions: Set<String> = []
     /// The last write action's result, shown inline; auto-clears on the next action.
@@ -67,6 +71,9 @@ final class StatusStore: ObservableObject {
 
     /// A description of the resolved engine invocation (shown in Settings / logs).
     var engineInvocation: String { client.invocationDescription }
+    /// False when no dayloop engine could be located — the UI shows a clear
+    /// "engine not found — set path in Settings" hint rather than an opaque error.
+    var engineResolved: Bool { client.isResolved }
     /// The repo the engine runs in — used to open goals.md / reveal reports.
     var repoURL: URL { client.workingDirectory }
     /// The day the current snapshot summarizes (fallback: today, local).
@@ -223,6 +230,29 @@ final class StatusStore: ObservableObject {
     func setConfig(_ key: String, _ value: String) {
         perform("config", ["config", "set", key, value], notice: "\(key) = \(value)") { [weak self] _ in
             self?.loadConfig()
+        }
+    }
+
+    /// Load whether a Gemini API key is stored (prints "set"/"not set" only).
+    func loadGeminiKeyState() {
+        Task {
+            let result = await client.runAsync(["config", "get", "gemini_api_key"], timeout: 8)
+            if case .success(let text) = result {
+                self.geminiKeyIsSet =
+                    text.trimmingCharacters(in: .whitespacesAndNewlines) == "set"
+            }
+        }
+    }
+
+    /// Save (or, with an empty string, clear) the BYOK Gemini API key. The value
+    /// is passed straight to the engine and is never placed in a notice or log —
+    /// only the resulting "set/not set" state is surfaced.
+    func setGeminiKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        perform("config", ["config", "set", "gemini_api_key", trimmed],
+                notice: trimmed.isEmpty ? "Gemini key cleared" : "Gemini key saved",
+                refreshAfter: false) { [weak self] _ in
+            self?.loadGeminiKeyState()
         }
     }
 

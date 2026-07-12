@@ -40,6 +40,7 @@ struct SettingsView: View {
     @State private var enginePath = ""
     @State private var loginEnabled = false
     @State private var loginHint: String?
+    @State private var geminiKey = ""
 
     private let refreshOptions: [(label: String, seconds: Int)] =
         [("15s", 15), ("30s", 30), ("1m", 60), ("5m", 300)]
@@ -62,6 +63,51 @@ struct SettingsView: View {
             Section("Behavior") {
                 Toggle("Nudges enabled", isOn: nudgesBinding)
                 Toggle("Pause capture", isOn: captureBinding)
+            }
+
+            Section("Sensors") {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(screenpipeOK ? Color.green : Color.secondary)
+                        .frame(width: 8, height: 8)
+                    Text("screenpipe")
+                    Spacer()
+                    if screenpipeOK {
+                        Text("running").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Link("Download screenpipe",
+                             destination: URL(string: "https://screenpi.pe")!)
+                            .font(.caption)
+                    }
+                }
+                Text(screenpipeOK
+                     ? "Local capture is active."
+                     : "screenpipe is an external app. Install it from screenpi.pe and grant Screen Recording + Microphone; dayloop detects it at localhost:3030.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Section("Gemini API key (BYOK)") {
+                SecureField("Paste key to enable Gemini (optional)", text: $geminiKey)
+                    .textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("Save key") {
+                        store.setGeminiKey(geminiKey)
+                        geminiKey = ""
+                    }
+                    .disabled(geminiKey.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Clear") {
+                        store.setGeminiKey("")
+                        geminiKey = ""
+                    }
+                    Spacer()
+                    Text(store.geminiKeyIsSet ? "key: set" : "key: not set")
+                        .font(.caption)
+                        .foregroundStyle(store.geminiKeyIsSet ? .green : .secondary)
+                }
+                Text("Stored locally in data/settings.json (gitignored), never shown back. Without a key, analysis stays local (ollama) with the gemini CLI OAuth fallback if installed.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
 
             Section("Engine location") {
@@ -90,7 +136,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 400, height: 460)
+        .frame(width: 400, height: 620)
         .onAppear(perform: load)
         .onChange(of: store.config) { _, cfg in
             if let cfg { apply(cfg) }
@@ -117,8 +163,13 @@ struct SettingsView: View {
 
     // MARK: - Load / apply
 
+    private var screenpipeOK: Bool {
+        store.status?.health.screenpipe.ok ?? false
+    }
+
     private func load() {
         store.loadConfig()
+        store.loadGeminiKeyState()
         enginePath = UserDefaults.standard.string(forKey: DayloopDefaults.enginePathKey) ?? ""
         loginEnabled = LoginItem.isEnabled
         if let cfg = store.config { apply(cfg) }

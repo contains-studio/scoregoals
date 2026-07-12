@@ -26,12 +26,24 @@ __all__ = [
     "default_config",
     "DEFAULTS",
     "SETTINGS_KEYS",
+    "SECRET_KEYS",
     "SETTINGS_FILENAME",
     "load_settings",
     "set_setting",
     "get_setting",
     "effective_settings",
 ]
+
+
+def _default_projects_dir() -> str:
+    """Home-relative default: ~/projects if it exists, else the home dir itself.
+
+    Portable across machines/users — never a hardcoded absolute path.
+    """
+    home = Path.home()
+    candidate = home / "projects"
+    return str(candidate if candidate.is_dir() else home)
+
 
 DEFAULTS: dict = {
     "data_dir": "./data",
@@ -41,8 +53,8 @@ DEFAULTS: dict = {
     "gemini_model": "gemini-2.5-flash",
     "gemini_price_in_per_1m": 0.30,   # USD per 1M input tokens — editable placeholder
     "gemini_price_out_per_1m": 2.50,  # USD per 1M output tokens — editable placeholder
-    "projects_dir": "/Users/contains/projects",
-    "github_user": "mgalpert",
+    "projects_dir": _default_projects_dir(),
+    "github_user": "",  # empty = auto-detect from `gh api user`
     "nudge_threshold_min": 20,
     "icloud_mirror": "",  # empty = off
     # --- app-mutable runtime settings (menu bar app writes these) ------------
@@ -78,7 +90,16 @@ SETTINGS_KEYS: dict[str, str] = {
     "refresh_seconds": "int",
     "ollama_url": "str",
     "gemini_model": "str",
+    "projects_dir": "str",  # scanned for local git activity (setup writes this)
+    "github_user": "str",   # "" = auto-detect via gh
 }
+
+# Secret keys the app/setup can WRITE (via `dayloop config set`) but that are
+# never echoed back, listed by `config` / `effective_settings`, or stored in
+# config.toml. They live only in data/settings.json (which is under data/ and
+# gitignored). Resolved-value precedence: env GEMINI_API_KEY > settings.json >
+# config.toml. Writing an empty value clears the stored secret.
+SECRET_KEYS: frozenset = frozenset({"gemini_api_key"})
 
 
 def _as_bool(value: object) -> bool:
@@ -202,13 +223,24 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
 
     # settings.json overlay: sits above config.toml, below env. data_dir itself
     # is never relocated from the overlay (the file lives inside data_dir).
-    for k, v in load_settings(data_dir).items():
+    overlay = load_settings(data_dir)
+    for k, v in overlay.items():
         if k in DEFAULTS and k != "data_dir":
             values[k] = v
     # Re-apply env so it wins over the overlay.
     _apply_env(values)
 
     goals_path = Path(str(raw.get("goals_path") or (base / "goals.md"))).expanduser()
+
+    # Gemini API key (BYOK): env wins, then the settings.json overlay (written by
+    # setup / the menu bar app), then config.toml. Never defaulted; never logged.
+    overlay_key = overlay.get("gemini_api_key")
+    gemini_api_key = (
+        os.environ.get("GEMINI_API_KEY")
+        or (str(overlay_key) if overlay_key else None)
+        or raw.get("gemini_api_key")
+        or None
+    )
 
     return Config(
         root=str(base),
@@ -222,7 +254,7 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
         ollama_url=str(values["ollama_url"]).rstrip("/"),
         ollama_model=str(values["ollama_model"]),
         gemini_model=str(values["gemini_model"]),
-        gemini_api_key=os.environ.get("GEMINI_API_KEY") or raw.get("gemini_api_key") or None,
+        gemini_api_key=gemini_api_key,
         gemini_price_in_per_1m=float(values["gemini_price_in_per_1m"]),
         gemini_price_out_per_1m=float(values["gemini_price_out_per_1m"]),
         projects_dir=str(values["projects_dir"]),
@@ -248,6 +280,8 @@ def effective_settings(config: Config) -> dict:
         "refresh_seconds": config.refresh_seconds,
         "ollama_url": config.ollama_url,
         "gemini_model": config.gemini_model,
+        "projects_dir": config.projects_dir,
+        "github_user": config.github_user,
     }
 
 
@@ -259,15 +293,25 @@ def get_setting(config: Config, key: str):
 
 
 def set_setting(config: Config, key: str, value: object) -> dict:
-    """Coerce and persist one app-mutable setting into data/settings.json
-    (merging with whatever is already there). Returns the new overlay dict.
-    Raises KeyError for unknown keys."""
-    if key not in SETTINGS_KEYS:
+    """Coerce and persist one setting into data/settings.json (merging with
+    whatever is already there). Returns the new overlay dict. Raises KeyError
+    for unknown keys.
+
+    Secret keys (SECRET_KEYS, e.g. gemini_api_key) are stored verbatim as a
+    string; an empty string clears the stored secret. The value is never logged.
+    """
+    if key not in SETTINGS_KEYS and key not in SECRET_KEYS:
         raise KeyError(key)
-    coerced = coerce_setting(key, value)
     path = Path(config.settings_path or (Path(config.data_dir) / SETTINGS_FILENAME))
     overlay = load_settings(config.data_dir)
-    overlay[key] = coerced
+    if key in SECRET_KEYS:
+        text = str(value)
+        if text == "":
+            overlay.pop(key, None)  # empty value clears the stored secret
+        else:
+            overlay[key] = text
+    else:
+        overlay[key] = coerce_setting(key, value)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(overlay, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return overlay

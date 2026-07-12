@@ -31,11 +31,18 @@ enum DayloopError: Error, CustomStringConvertible {
 
 /// Resolves how to invoke the dayloop engine and runs subcommands via `Process`.
 ///
-/// Resolution order:
-///   1. `$DAYLOOP_BIN`                        (hard executable override, cwd = repo)
-///   2. UserDefaults `enginePathKey`          (a repo dir, or an explicit binary)
-///   3. `<repo>/.venv/bin/dayloop`            (console-script launcher, if present)
-///   4. `<repo>/.venv/bin/python -m dayloop`  (module fallback)
+/// Repo resolution order (portable — no hardcoded user paths):
+///   1. UserDefaults `enginePathKey`          (a repo dir, or an explicit binary)
+///   2. `$DAYLOOP_BIN`                        (hard executable override, cwd = repo)
+///   3. walk up from `Bundle.main.bundleURL` for a dir with `dayloop/cli.py` + `.venv`
+///      (covers running the .app from menubar/ inside the repo)
+///   4. `~/projects/dayloop` then `~/dayloop`  (last-resort guesses)
+///   5. none of the above resolve -> an UNRESOLVED client (`isResolved == false`)
+///      so the UI can show "engine not found — set path in Settings" instead of
+///      an opaque launch error.
+///
+/// Once a repo is chosen, the executable is `<repo>/.venv/bin/dayloop` (console
+/// script) if present, else `<repo>/.venv/bin/python -m dayloop`.
 ///
 /// All blocking work happens on a background queue supplied by the caller (see
 /// StatusStore) or by `runAsync`; the blocking `run`/`runAction` must never be
@@ -50,65 +57,113 @@ struct DayloopClient {
     /// Optional debug log path (from DAYLOOP_BAR_DEBUG). Every invocation is appended.
     let debugLogPath: String?
 
-    static let defaultRepo = URL(fileURLWithPath: "/Users/contains/projects/dayloop")
+    /// True when `executable` actually exists — i.e. a real engine was located.
+    /// The UI uses this to distinguish "engine not found / not installed" from a
+    /// transient runtime error.
+    var isResolved: Bool {
+        FileManager.default.isExecutableFile(atPath: executable.path)
+    }
+
+    /// Placeholder executable for the unresolved state (never exists / never runs).
+    private static let unresolvedExecutable = URL(fileURLWithPath: "/nonexistent/dayloop-engine-not-found")
 
     /// Background queue backing `runAsync` so callers never block a thread pool.
     private static let asyncQueue = DispatchQueue(label: "dayloop.action", qos: .userInitiated, attributes: .concurrent)
 
-    /// Build the default client, honouring env + the persisted engine path.
-    static func resolveDefault(repo defaultRepo: URL = DayloopClient.defaultRepo,
-                               environment: [String: String] = ProcessInfo.processInfo.environment,
-                               defaults: UserDefaults = .standard) -> DayloopClient {
+    /// Build the default client, honouring the persisted engine path, env, the
+    /// app bundle's location, and home-dir guesses (see the resolution order above).
+    static func resolveDefault(environment: [String: String] = ProcessInfo.processInfo.environment,
+                               defaults: UserDefaults = .standard,
+                               bundleURL: URL? = Bundle.main.bundleURL) -> DayloopClient {
         let debug = resolveDebugLog(environment)
         let fm = FileManager.default
 
-        // Determine the repo directory: a valid UserDefaults directory override,
-        // else the compiled-in default. A UserDefaults value pointing at an
-        // executable file is treated as an explicit binary instead.
-        var repo = defaultRepo
+        // (1) UserDefaults engine-path override: a repo dir, or an explicit binary.
         if let custom = defaults.string(forKey: DayloopDefaults.enginePathKey), !custom.isEmpty {
             var isDir: ObjCBool = false
             if fm.fileExists(atPath: custom, isDirectory: &isDir) {
                 if isDir.boolValue {
-                    repo = URL(fileURLWithPath: custom)
+                    return clientForRepo(URL(fileURLWithPath: custom), debug: debug, fm: fm)
                 } else if fm.isExecutableFile(atPath: custom) {
                     return DayloopClient(executable: URL(fileURLWithPath: custom),
                                          baseArguments: [],
-                                         workingDirectory: repoGuess(forBinary: custom, fallback: defaultRepo),
+                                         workingDirectory: repoGuess(forBinary: custom, fm: fm),
                                          debugLogPath: debug)
                 }
             }
+            // custom set but invalid -> fall through to auto-resolution.
         }
 
-        // A hard executable override still wins for *what* to run; cwd = repo.
+        // (2) A hard executable override still wins for *what* to run; cwd = repo.
         if let override = environment["DAYLOOP_BIN"], !override.isEmpty {
+            let repo = locateRepo(bundleURL: bundleURL, fm: fm)
+                ?? fm.homeDirectoryForCurrentUser
             return DayloopClient(executable: URL(fileURLWithPath: override),
                                  baseArguments: [],
                                  workingDirectory: repo,
                                  debugLogPath: debug)
         }
 
+        // (3)+(4) Locate the repo from the bundle location, then home guesses.
+        if let repo = locateRepo(bundleURL: bundleURL, fm: fm) {
+            return clientForRepo(repo, debug: debug, fm: fm)
+        }
+
+        // (5) Nothing resolved — return an unresolved client (isResolved == false).
+        return DayloopClient(executable: unresolvedExecutable,
+                             baseArguments: [],
+                             workingDirectory: fm.homeDirectoryForCurrentUser,
+                             debugLogPath: debug)
+    }
+
+    /// True when `url` looks like a dayloop repo: has `dayloop/cli.py` and a `.venv`.
+    private static func isRepo(_ url: URL, fm: FileManager) -> Bool {
+        fm.fileExists(atPath: url.appendingPathComponent("dayloop/cli.py").path)
+            && fm.fileExists(atPath: url.appendingPathComponent(".venv").path)
+    }
+
+    /// Walk up from the app bundle for a dayloop repo, then try `~/projects/dayloop`
+    /// and `~/dayloop`. Returns nil when none look like a usable repo.
+    static func locateRepo(bundleURL: URL?, fm: FileManager = .default) -> URL? {
+        if var dir = bundleURL {
+            for _ in 0..<10 {
+                if isRepo(dir, fm: fm) { return dir }
+                let parent = dir.deletingLastPathComponent()
+                if parent.path == dir.path { break }   // reached filesystem root
+                dir = parent
+            }
+        }
+        let home = fm.homeDirectoryForCurrentUser
+        for guess in ["projects/dayloop", "dayloop"] {
+            let url = home.appendingPathComponent(guess)
+            if isRepo(url, fm: fm) { return url }
+        }
+        return nil
+    }
+
+    /// Build a client for a known repo: prefer the `.venv/bin/dayloop` launcher,
+    /// else `.venv/bin/python -m dayloop`.
+    private static func clientForRepo(_ repo: URL, debug: String?, fm: FileManager) -> DayloopClient {
         let launcher = repo.appendingPathComponent(".venv/bin/dayloop")
-        let python = repo.appendingPathComponent(".venv/bin/python")
         if fm.isExecutableFile(atPath: launcher.path) {
             return DayloopClient(executable: launcher,
                                  baseArguments: [],
                                  workingDirectory: repo,
                                  debugLogPath: debug)
         }
-        return DayloopClient(executable: python,
+        return DayloopClient(executable: repo.appendingPathComponent(".venv/bin/python"),
                              baseArguments: ["-m", "dayloop"],
                              workingDirectory: repo,
                              debugLogPath: debug)
     }
 
     /// Guess the repo for an explicit binary at `<repo>/.venv/bin/<x>` (3 levels up).
-    private static func repoGuess(forBinary path: String, fallback: URL) -> URL {
+    private static func repoGuess(forBinary path: String, fm: FileManager) -> URL {
         let url = URL(fileURLWithPath: path)
         let up = url.deletingLastPathComponent()   // .../.venv/bin
             .deletingLastPathComponent()           // .../.venv
             .deletingLastPathComponent()           // .../<repo>
-        return up.path.isEmpty || up.path == "/" ? fallback : up
+        return up.path.isEmpty || up.path == "/" ? fm.homeDirectoryForCurrentUser : up
     }
 
     private static func resolveDebugLog(_ env: [String: String]) -> String? {
@@ -178,7 +233,7 @@ struct DayloopClient {
     /// Launch the child, drain both pipes, enforce the timeout. Only fails for
     /// launch/timeout; otherwise returns `(terminationStatus, stdout, stderr)`.
     private func execute(_ args: [String], timeout: TimeInterval) -> Result<(Int32, Data, Data), DayloopError> {
-        log("run: \(args.joined(separator: " "))")
+        log("run: \(Self.redactedArgs(args).joined(separator: " "))")
 
         let process = Process()
         process.executableURL = executable
@@ -241,6 +296,19 @@ struct DayloopClient {
         let status = process.terminationStatus
         log("exit \(status): out \(outData.count)B err \(errData.count)B")
         return .success((status, outData, errData))
+    }
+
+    /// Config keys whose value must never reach the debug log.
+    private static let secretConfigKeys: Set<String> = ["gemini_api_key"]
+
+    /// Redact `config set <secret-key> <value>` so a secret can't leak into the
+    /// (opt-in) debug log.
+    private static func redactedArgs(_ args: [String]) -> [String] {
+        guard args.count >= 4, args[0] == "config", args[1] == "set",
+              secretConfigKeys.contains(args[2]) else { return args }
+        var copy = args
+        copy[3] = "***"
+        return copy
     }
 
     // Append-only debug log; best-effort, never throws into the caller.

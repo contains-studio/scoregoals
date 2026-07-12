@@ -1,4 +1,8 @@
-"""Sensor: GitHub + local git activity for config.github_user (mgalpert).
+"""Sensor: GitHub + local git activity for config.github_user.
+
+When config.github_user is empty it is resolved once per run from the
+authenticated `gh` CLI (`gh api user --jq .login`); if gh is missing/unauthed
+the server sweep is skipped gracefully (local git sweep still runs).
 
 fetch() unions two sources and dedupes:
 
@@ -237,11 +241,35 @@ def _gh_search_prs(date: str, user: str) -> list[ActivityRecord]:
     return records
 
 
+# Resolved-login cache: `gh api user` is called at most once per process run.
+_LOGIN_CACHE: dict[str, str] = {}
+
+
+def _resolve_login() -> str:
+    """Resolve the authenticated GitHub login via `gh api user`, cached per run.
+
+    Returns "" (never raises) when gh is missing/unauthed or the call fails, so
+    an empty github_user degrades to "skip server activity" rather than crashing.
+    """
+    if "login" in _LOGIN_CACHE:
+        return _LOGIN_CACHE["login"]
+    login = ""
+    if shutil.which("gh") is not None:
+        out = _gh(["api", "user", "--jq", ".login"])
+        if out:
+            login = out.strip()
+    _LOGIN_CACHE["login"] = login
+    return login
+
+
 def _gh_activity(date: str, config: Config) -> list[ActivityRecord]:
     if shutil.which("gh") is None:
         _log("gh CLI not found on PATH; skipping server activity")
         return []
-    user = config.github_user
+    user = (config.github_user or "").strip() or _resolve_login()
+    if not user:
+        _log("github_user empty and could not resolve login via gh; skipping server activity")
+        return []
     return _gh_events(date, user) + _gh_search_prs(date, user)
 
 

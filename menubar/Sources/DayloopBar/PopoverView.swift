@@ -81,6 +81,7 @@ struct PopoverView: View {
     }
 
     private var onTrackText: String {
+        if !store.engineResolved { return "engine not found — set path in Settings" }
         if store.status == nil, store.lastError != nil { return "engine unavailable" }
         guard let s = store.status else { return "loading…" }
         switch store.barState {
@@ -324,21 +325,55 @@ struct PopoverView: View {
     // MARK: - 7. Footer
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let screenpipe = store.status?.health.screenpipe
+        let screenpipeOK = screenpipe?.ok ?? false
+        return VStack(alignment: .leading, spacing: 8) {
+            if !store.engineResolved {
+                HStack(spacing: 6) {
+                    Label("engine not found", systemImage: "bolt.slash.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                    Spacer(minLength: 6)
+                    Button("Set path…") { openSettings() }
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                }
+            }
             if let err = store.lastError {
                 Label(err, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2)
                     .foregroundStyle(.red)
                     .lineLimit(2)
             }
+            // Screenpipe is an external dependency: when it's unreachable, offer
+            // the official download instead of trying to launch it ourselves.
+            if !screenpipeOK {
+                HStack(spacing: 6) {
+                    Image(systemName: "sensor.tag.radiowaves.forward")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("screenpipe not running")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 6)
+                    Link("Download", destination: URL(string: "https://screenpi.pe")!)
+                        .font(.caption2)
+                }
+            }
             HStack(spacing: 10) {
                 healthChip(
-                    ok: store.status?.health.screenpipe.ok ?? false,
-                    label: "screenpipe"
+                    ok: screenpipeOK,
+                    label: "screenpipe",
+                    help: screenpipeOK
+                        ? (screenpipe?.detail ?? "reachable")
+                        : "not reachable — install the desktop app at https://screenpi.pe"
                 )
                 healthChip(
                     ok: store.status?.health.backend.ollamaOk ?? false,
-                    label: store.status?.health.backend.defaultBackend ?? "backend"
+                    label: store.status?.health.backend.defaultBackend ?? "backend",
+                    help: store.status?.health.backend.gemini == "off"
+                        ? "ollama backend"
+                        : "gemini: \(store.status?.health.backend.gemini ?? "off")"
                 )
                 Spacer()
                 Text(lastCaptureText)
@@ -348,7 +383,7 @@ struct PopoverView: View {
         }
     }
 
-    private func healthChip(ok: Bool, label: String) -> some View {
+    private func healthChip(ok: Bool, label: String, help: String) -> some View {
         HStack(spacing: 4) {
             Circle()
                 .fill(ok ? Color.green : Color.secondary)
@@ -357,6 +392,7 @@ struct PopoverView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+        .help(help)
     }
 
     private var lastCaptureText: String {

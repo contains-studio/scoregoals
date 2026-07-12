@@ -162,7 +162,7 @@ health/backend info — still works from the engine's stored timeline. Generate 
 deterministic day to see the full popover with no sensors:
 
 ```sh
-/Users/contains/projects/dayloop/.venv/bin/python -m dayloop mock --date 2026-07-11
+.venv/bin/python -m dayloop mock --date 2026-07-11
 ```
 
 Install screenpipe/icalBuddy later and the live sections fill in automatically —

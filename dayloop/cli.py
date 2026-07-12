@@ -343,10 +343,17 @@ def cmd_config_show(args: argparse.Namespace) -> int:
 
 
 def cmd_config_get(args: argparse.Namespace) -> int:
-    """config get <key>: print one setting's effective value."""
-    cfg = _cfg(args)
-    from .config import SETTINGS_KEYS, get_setting
+    """config get <key>: print one setting's effective value.
 
+    Secret keys (e.g. gemini_api_key) print only "set"/"not set" — never the
+    stored value.
+    """
+    cfg = _cfg(args)
+    from .config import SECRET_KEYS, SETTINGS_KEYS, get_setting
+
+    if args.key in SECRET_KEYS:
+        print("set" if getattr(cfg, args.key, None) else "not set")
+        return 0
     try:
         v = get_setting(cfg, args.key)
     except KeyError:
@@ -360,19 +367,28 @@ def cmd_config_get(args: argparse.Namespace) -> int:
 
 
 def cmd_config_set(args: argparse.Namespace) -> int:
-    """config set <key> <value>: persist one setting to data/settings.json."""
+    """config set <key> <value>: persist one setting to data/settings.json.
+
+    Secret keys (e.g. gemini_api_key) are stored but never echoed back — the
+    confirmation prints only "set"/"not set". Pass an empty value to clear one.
+    """
     cfg = _cfg(args)
-    from .config import SETTINGS_KEYS, get_setting, set_setting
+    from .config import SECRET_KEYS, SETTINGS_KEYS, get_setting, set_setting
 
     try:
         set_setting(cfg, args.key, args.value)
     except KeyError:
+        settable = list(SETTINGS_KEYS) + sorted(SECRET_KEYS)
         print(
-            f"dayloop: unknown config key {args.key!r}; settable: {', '.join(SETTINGS_KEYS)}",
+            f"dayloop: unknown config key {args.key!r}; settable: {', '.join(settable)}",
             file=sys.stderr,
         )
         return 2
     reloaded = _cfg(args)
+    if args.key in SECRET_KEYS:
+        state = "set" if getattr(reloaded, args.key, None) else "not set"
+        print(f"{args.key} = {state} (saved to {reloaded.settings_path})")
+        return 0
     v = get_setting(reloaded, args.key)
     print(f"{args.key} = {json.dumps(v)} (saved to {reloaded.settings_path})")
     return 0
@@ -407,7 +423,8 @@ def _check_screenpipe(cfg: Config) -> tuple[bool, str]:
     except Exception:
         return False, (
             f"not reachable at {cfg.screenpipe_url}"
-            " — install/start screenpipe for live capture (mock mode works without it)"
+            " — install the desktop app: https://screenpi.pe"
+            " (mock mode works without it)"
         )
 
 

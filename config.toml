@@ -14,7 +14,9 @@ gemini_model = "gemini-2.5-flash"
 gemini_price_in_per_1m = 0.30
 gemini_price_out_per_1m = 2.50
 
-projects_dir = "/Users/contains/projects" # scanned for local git activity + project inference
-github_user = "mgalpert"
+# projects_dir = "~/projects"            # scanned for local git activity + project inference;
+                                          # commented = auto (~/projects if it exists, else ~).
+                                          # setup.sh writes your choice into data/settings.json.
+github_user = ""                          # empty = auto-detect from `gh` (gh api user --jq .login)
 nudge_threshold_min = 20                  # minutes of off-goal drift before a nudge fires
-icloud_mirror = ""                        # e.g. "/Users/contains/Library/Mobile Documents/com~apple~CloudDocs/dayloop"; empty = off
+icloud_mirror = ""                        # e.g. "~/Library/Mobile Documents/com~apple~CloudDocs/dayloop"; empty = off

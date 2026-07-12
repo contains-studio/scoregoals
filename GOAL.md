@@ -24,7 +24,7 @@ sensor installs + macOS permission grants.
 These exact commands pass today (verified 2026-07-11, venv at `.venv`):
 
 ```sh
-cd /Users/contains/projects/dayloop
+cd ~/projects/dayloop
 .venv/bin/python -m dayloop --help                       # exit 0
 .venv/bin/python -m dayloop doctor                       # 5/7 checks (screenpipe + icalBuddy absent)
 .venv/bin/python -m dayloop mock --date 2026-07-11       # 7 sessions, 304 active min
@@ -55,7 +55,7 @@ own self-reported score is kept in the report JSON `raw.llm_overall_score`).
 Run these five and eyeball the output:
 
 ```sh
-cd /Users/contains/projects/dayloop
+cd ~/projects/dayloop
 
 # 1. Environment checklist
 .venv/bin/python -m dayloop doctor

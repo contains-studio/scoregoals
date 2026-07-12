@@ -38,15 +38,30 @@ Everything stays on-device except what you explicitly send to Gemini.
                      Michael adjusts tomorrow ──► (loop)
 ```
 
-## Quick start (works today, no screenpipe needed)
+## Quick start
+
+One command sets up the venv, installs the engine, and (optionally) builds the
+menu bar app. See [SETUP.md](SETUP.md) for the full colleague-facing guide.
 
 ```sh
-cd /Users/contains/projects/dayloop
-python3 -m dayloop doctor                    # environment checklist
-python3 -m dayloop mock --date 2026-07-11    # deterministic test timeline
-python3 -m dayloop analyze 2026-07-11 --backend ollama   # local model + benchmark row
-python3 -m dayloop report  2026-07-11 --backend ollama   # -> data/reports/2026-07-11-eod.md
+git clone <this-repo> ~/projects/dayloop
+cd ~/projects/dayloop
+./scripts/setup.sh                           # venv + install + prompts, idempotent
 ```
+
+Then, from the repo (works today, no screenpipe needed — uses the mock day):
+
+```sh
+.venv/bin/python -m dayloop doctor                    # environment checklist
+.venv/bin/python -m dayloop mock --date 2026-07-11    # deterministic test timeline
+.venv/bin/python -m dayloop analyze 2026-07-11 --backend ollama   # local model + benchmark row
+.venv/bin/python -m dayloop report  2026-07-11 --backend ollama   # -> data/reports/2026-07-11-eod.md
+```
+
+For live capture, install the screenpipe desktop app (external dependency) from
+<https://screenpi.pe> and grant Screen Recording + Microphone. Gemini is
+bring-your-own-key (optional); set it during setup or later with
+`.venv/bin/python -m dayloop config set gemini_api_key <key>`.
 
 All commands: `capture`, `analyze`, `report`, `plan`, `nudge`, `weekly`,
 `mock`, `status`, `today`, `focus`, `config`, `doctor` — see
@@ -104,5 +119,10 @@ absent (mock still works).
   `dayloop/feedback/` — actuators
 - `config.toml` — defaults that work out of the box; `goals.md` — your goals
 - `data/` — sqlite + JSON timelines/reports/benchmarks (gitignored)
+
+## Setup
+
+New here? [SETUP.md](SETUP.md) is the colleague-facing guide: prerequisites, the
+three-step install, where data lives, and how to set the Gemini key.
 
 **Definition of done and the full test plan live in [GOAL.md](GOAL.md).**

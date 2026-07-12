@@ -7,7 +7,7 @@ name = "dayloop"
 version = "0.1.0"
 description = "Personal, local-first cybernetic activity tracker for macOS (screenpipe -> timeline -> goals -> feedback)"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Michael Galpert", email = "mgalpert@gmail.com" }]
 dependencies = [

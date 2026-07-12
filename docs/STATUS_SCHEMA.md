@@ -17,8 +17,8 @@ Timestamps are ISO-8601 strings with a UTC offset (e.g.
 `"2026-07-11T18:51:04-07:00"`), except a few date-only calendar/session strings
 that may be naive local (`"2026-07-11T18:30:00"`); the app should parse both.
 
-Run the engine as:
-`/Users/contains/projects/dayloop/.venv/bin/python -m dayloop <command>`
+Run the engine from the repo root as:
+`.venv/bin/python -m dayloop <command>`
 
 ---
 
