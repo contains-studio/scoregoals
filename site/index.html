@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScoreGoals — know where your day actually went</title>
+<meta name="description" content="A local-first macOS menu bar app that watches what you actually do, scores your day against your own goals, and learns from your corrections.">
+<meta property="og:title" content="ScoreGoals">
+<meta property="og:description" content="Know where your day actually went. Local-first, open source, lives in your menu bar.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23131C33'/><circle cx='50' cy='50' r='30' fill='none' stroke='%23ffffff22' stroke-width='9'/><path d='M50 20 a30 30 0 1 1 -25 46' fill='none' stroke='%2338DE9E' stroke-width='9' stroke-linecap='round'/></svg>">
+<style>
+  :root{
+    --wall-0:#0B1526; --wall-1:#14294a; --wall-2:#0E1B2E;
+    --glass:rgba(255,255,255,.07); --glass-hi:rgba(255,255,255,.12);
+    --stroke:rgba(255,255,255,.14); --stroke-soft:rgba(255,255,255,.08);
+    --ink:#EAF2FB; --ink-2:#9FB3CC; --ink-3:#66788f;
+    --mint:#38DE9E; --amber:#F5B84A; --red:#F46A5A;
+    --mono:ui-monospace,'SF Mono',SFMono-Regular,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',system-ui,sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:var(--sans); color:var(--ink); background:var(--wall-2);
+    background-image:
+      radial-gradient(1200px 700px at 70% -10%, var(--wall-1), transparent 60%),
+      radial-gradient(900px 600px at 10% 110%, #16324f66, transparent 55%),
+      linear-gradient(180deg, var(--wall-0), var(--wall-2) 60%);
+    background-attachment:fixed; min-height:100vh; overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+
+  /* ---------- the Mac menu bar (hero chrome) ---------- */
+  .macbar{
+    position:sticky; top:0; z-index:50; height:34px;
+    display:flex; align-items:center; gap:18px; padding:0 16px;
+    background:rgba(14,23,38,.72); backdrop-filter:blur(22px) saturate(1.4);
+    -webkit-backdrop-filter:blur(22px) saturate(1.4);
+    border-bottom:1px solid var(--stroke-soft);
+    font-size:13px; color:var(--ink-2); user-select:none;
+    transform:translateY(-40px); animation:bardrop .5s .1s cubic-bezier(.2,.9,.3,1.2) forwards;
+  }
+  @keyframes bardrop{to{transform:translateY(0)}}
+  .macbar .apple{font-size:15px;color:var(--ink)}
+  .macbar .appname{font-weight:600;color:var(--ink)}
+  .macbar .spacer{flex:1}
+  .macbar .tray{display:flex;align-items:center;gap:16px;font-size:12.5px}
+  .gauge-item{
+    display:flex;align-items:center;gap:5px;padding:2px 8px;border-radius:6px;
+    background:rgba(56,222,158,.13); outline:1px solid rgba(56,222,158,.35);
+    color:var(--ink); font-variant-numeric:tabular-nums; position:relative;
+  }
+  .gauge-item::after{
+    content:""; position:absolute; inset:-5px; border-radius:9px;
+    outline:2px solid rgba(56,222,158,.35); opacity:0;
+    animation:halo 2.4s 1.6s ease-out 2;
+  }
+  @keyframes halo{0%{opacity:0;transform:scale(.9)}30%{opacity:1}100%{opacity:0;transform:scale(1.25)}}
+  .ring{width:15px;height:15px}
+  .tray .dim{opacity:.75}
+
+  /* ---------- hero ---------- */
+  .hero{display:grid;grid-template-columns:1fr 400px;gap:56px;align-items:center;padding:88px 0 72px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--mint);text-transform:uppercase;margin-bottom:18px}
+  h1{font-size:clamp(38px,5.4vw,60px);line-height:1.03;font-weight:800;letter-spacing:-.025em}
+  h1 .quiet{color:var(--ink-2);font-weight:700}
+  .sub{margin-top:22px;font-size:18px;line-height:1.65;color:var(--ink-2);max-width:46ch}
+  .sub strong{color:var(--ink);font-weight:600}
+  .ctas{margin-top:34px;display:flex;gap:14px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:9px;padding:13px 22px;border-radius:11px;font-size:15px;font-weight:600;text-decoration:none;transition:transform .15s ease, background .15s ease}
+  .btn:active{transform:scale(.97)}
+  .btn-primary{background:var(--mint);color:#08131f}
+  .btn-primary:hover{background:#4ce8ab}
+  .btn-ghost{background:var(--glass);outline:1px solid var(--stroke);color:var(--ink)}
+  .btn-ghost:hover{background:var(--glass-hi)}
+  .hero-note{margin-top:18px;font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+
+  /* ---------- the popover (the product, recreated) ---------- */
+  .popwrap{position:relative;justify-self:end;filter:drop-shadow(0 30px 60px rgba(0,0,0,.5))}
+  .popover{
+    width:340px;border-radius:16px;overflow:hidden;
+    background:rgba(28,36,52,.88); backdrop-filter:blur(30px) saturate(1.5);
+    -webkit-backdrop-filter:blur(30px) saturate(1.5);
+    outline:1px solid var(--stroke); font-size:13px;
+    transform:scale(.92) translateY(-14px); opacity:0;
+    animation:popin .55s .55s cubic-bezier(.2,.9,.25,1.15) forwards;
+  }
+  @keyframes popin{to{transform:none;opacity:1}}
+  .popover::before{ /* callout arrow */
+    content:""; position:absolute; top:-7px; right:34px; width:14px; height:14px;
+    background:rgba(28,36,52,.95); transform:rotate(45deg);
+    border-top:1px solid var(--stroke); border-left:1px solid var(--stroke);
+  }
+  .pop-pad{padding:14px 16px}
+  .pop-head{display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--stroke-soft)}
+  .score-big{font-size:34px;font-weight:800;color:var(--mint);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .score-big small{font-size:15px;color:var(--ink-3);font-weight:600}
+  .pop-head .state{flex:1}
+  .state .ok{color:var(--mint);font-weight:600;font-size:13px}
+  .state .date{color:var(--ink-3);font-size:11.5px;margin-top:2px}
+  .gear{color:var(--ink-3);font-size:15px}
+  .sec{padding:11px 16px;border-bottom:1px solid var(--stroke-soft)}
+  .sec-label{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--ink-3);text-transform:uppercase;margin-bottom:8px}
+  .now-row{display:flex;align-items:center;gap:8px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 8px var(--mint)}
+  .now-row .app{font-weight:600}
+  .now-row .to{color:var(--ink-3)}
+  .now-row .goal{color:var(--mint)}
+  .now-row .min{margin-left:auto;color:var(--ink-3);font-variant-numeric:tabular-nums}
+  .todo{display:flex;align-items:center;gap:9px;padding:5px 0}
+  .todo .box{width:15px;height:15px;border-radius:4.5px;outline:1.5px solid var(--stroke);flex-shrink:0;display:grid;place-items:center;font-size:10px}
+  .todo.done .box{background:var(--mint);outline-color:var(--mint);color:#08131f}
+  .todo.done .txt{text-decoration:line-through;color:var(--ink-3)}
+  .todo .bar{margin-left:auto;width:64px;height:4px;border-radius:2px;background:var(--stroke-soft);overflow:hidden;flex-shrink:0}
+  .todo .bar i{display:block;height:100%;background:var(--mint);border-radius:2px}
+  .review-row{display:flex;align-items:center;gap:8px;padding:6px 8px;margin:0 -8px;border-radius:8px;background:rgba(245,184,74,.07);outline:1px solid rgba(245,184,74,.2)}
+  .review-row .t{flex:1;min-width:0}
+  .review-row .t b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .review-row .t span{font-size:11px;color:var(--ink-3)}
+  .chip{font-size:10.5px;padding:3px 8px;border-radius:6px;background:var(--glass);outline:1px solid var(--stroke);white-space:nowrap;color:var(--ink-2)}
+  .chip.ok{background:rgba(56,222,158,.15);outline-color:rgba(56,222,158,.4);color:var(--mint)}
+  .goalrow{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:12.5px}
+  .goalrow .nm{width:118px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .goalrow .track{flex:1;height:5px;border-radius:3px;background:var(--stroke-soft);position:relative;overflow:visible}
+  .goalrow .fill{position:absolute;inset:0 auto 0 0;border-radius:3px;background:var(--mint)}
+  .goalrow .tgt{position:absolute;top:-2.5px;width:1.5px;height:10px;background:var(--ink-3)}
+  .goalrow .pct{width:64px;text-align:right;color:var(--ink-3);font-variant-numeric:tabular-nums;font-size:11.5px}
+  .goalrow.warn .fill{background:var(--amber)}
+  .week{display:flex;align-items:flex-end;gap:4px;height:26px;margin-top:8px}
+  .week i{flex:1;border-radius:2px 2px 0 0;background:rgba(56,222,158,.5)}
+  .week i.gap{background:var(--stroke-soft);height:3px !important}
+  .week i.today{background:var(--mint)}
+  .pop-foot{display:flex;gap:10px;align-items:center;padding:10px 16px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+  .pop-foot .live{color:var(--mint)}
+
+  /* ---------- loop strip ---------- */
+  .loop{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;padding:26px 24px;margin:8px 0 72px;font-family:var(--mono);font-size:13px;letter-spacing:.08em}
+  .loop b{color:var(--ink);font-weight:600;padding:7px 15px;border-radius:9px;background:var(--glass);outline:1px solid var(--stroke)}
+  .loop span{color:var(--ink-3)}
+  .loop .you{color:var(--mint);outline-color:rgba(56,222,158,.4)}
+
+  /* ---------- feature cards ---------- */
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;padding-bottom:84px}
+  .card{
+    background:var(--glass);outline:1px solid var(--stroke-soft);border-radius:18px;padding:26px;
+    transition:transform .2s ease, background .2s ease;
+  }
+  .card:hover{transform:translateY(-3px);background:var(--glass-hi)}
+  .card h3{font-size:17px;font-weight:700;margin-bottom:9px}
+  .card p{font-size:14px;line-height:1.6;color:var(--ink-2)}
+  .card .demo{margin-top:18px;border-radius:11px;background:rgba(10,17,30,.6);outline:1px solid var(--stroke-soft);padding:13px 14px;font-size:12.5px}
+  .flash{font-family:var(--mono);color:var(--mint);font-size:12px}
+  .dash{font-size:26px;color:var(--ink-3);font-weight:700}
+  .redact{font-family:var(--mono);font-size:11.5px;line-height:1.8;color:var(--ink-2);word-break:break-all}
+  .redact .r{color:var(--amber);background:rgba(245,184,74,.12);padding:1px 5px;border-radius:4px}
+
+  /* ---------- terminal ---------- */
+  .term-wrap{padding-bottom:96px}
+  .term-head{text-align:center;margin-bottom:26px}
+  .term-head h2{font-size:26px;font-weight:800;letter-spacing:-.02em}
+  .term-head p{color:var(--ink-2);margin-top:8px;font-size:15px}
+  .term{
+    max-width:640px;margin:0 auto;border-radius:14px;overflow:hidden;
+    background:rgba(8,13,24,.85);outline:1px solid var(--stroke-soft);
+    box-shadow:0 24px 50px rgba(0,0,0,.4);
+  }
+  .term-bar{display:flex;gap:7px;padding:11px 14px;background:rgba(255,255,255,.05)}
+  .term-bar i{width:11px;height:11px;border-radius:50%;background:#3a4557}
+  .term-bar i:nth-child(1){background:#f46a5a}.term-bar i:nth-child(2){background:#f5b84a}.term-bar i:nth-child(3){background:#38de9e}
+  .term pre{padding:20px 22px;font-family:var(--mono);font-size:13px;line-height:2;color:var(--ink-2);overflow-x:auto}
+  .term .c{color:var(--ink-3)} .term .g{color:var(--mint)}
+
+  footer{border-top:1px solid var(--stroke-soft);padding:34px 24px;text-align:center;font-size:13px;color:var(--ink-3)}
+  footer a{color:var(--ink-2);text-decoration:none;border-bottom:1px solid var(--stroke)}
+  footer a:hover{color:var(--ink)}
+  footer .row{display:flex;gap:22px;justify-content:center;flex-wrap:wrap;margin-bottom:14px}
+
+  @media (max-width:900px){
+    .hero{grid-template-columns:1fr;gap:44px;padding-top:56px}
+    .popwrap{justify-self:center}
+    .popover::before{right:160px}
+    .cards{grid-template-columns:1fr}
+    .macbar .tray .hideable{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation:none !important;transition:none !important;transform:none !important;opacity:1 !important}
+  }
+  :focus-visible{outline:2px solid var(--mint);outline-offset:3px;border-radius:4px}
+</style>
+</head>
+<body>
+
+<!-- the Mac menu bar -->
+<div class="macbar" aria-hidden="true">
+  <span class="apple"></span>
+  <span class="appname">ScoreGoals</span>
+  <span class="spacer"></span>
+  <span class="tray">
+    <span class="dim hideable">⌘</span>
+    <span class="dim hideable">◐</span>
+    <span class="gauge-item">
+      <svg class="ring" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="12" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="5"/>
+        <circle id="barring" cx="16" cy="16" r="12" fill="none" stroke="#38DE9E" stroke-width="5"
+                stroke-linecap="round" stroke-dasharray="75.4" stroke-dashoffset="75.4"
+                transform="rotate(-90 16 16)"/>
+      </svg>
+      <span id="barnum">—</span>
+    </span>
+    <span class="dim hideable">🔋 82%</span>
+    <span class="dim hideable">📶</span>
+    <span class="dim">Sat 9:41 AM</span>
+  </span>
+</div>
+
+<main class="wrap">
+  <!-- hero -->
+  <section class="hero">
+    <div>
+      <p class="eyebrow">open source · local-first · macOS</p>
+      <h1>Know where your day <span class="quiet">actually</span> went.</h1>
+      <p class="sub">ScoreGoals sits in your menu bar, watches what you really do —
+        screen, meetings, commits — and <strong>scores the day against goals you wrote</strong>.
+        Correct it when it's wrong, and it learns your patterns until it rarely needs you.</p>
+      <div class="ctas">
+        <a class="btn btn-primary" href="https://github.com/contains-studio/scoregoals">Get it on GitHub</a>
+        <a class="btn btn-ghost" href="#how">How it works</a>
+      </div>
+      <p class="hero-note">$ git clone · ./scripts/setup.sh · your data never leaves your Mac</p>
+    </div>
+
+    <!-- the popover, recreated with mock data -->
+    <div class="popwrap">
+      <div class="popover" role="img" aria-label="The ScoreGoals menu bar popover showing a day scored 72 out of 100, three intentions, one session to review, and time per goal.">
+        <div class="pop-pad pop-head">
+          <div class="score-big"><span id="popnum">0</span><small> /100</small></div>
+          <div class="state">
+            <div class="ok">On track</div>
+            <div class="date">Saturday · 6h 12m active</div>
+          </div>
+          <div class="gear">⚙</div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-label">Now</div>
+          <div class="now-row">
+            <span class="dot"></span>
+            <span class="app">VS Code</span><span class="to">→</span><span class="goal">Ship the redesign</span>
+            <span class="min">23m</span>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-label">Today's three</div>
+          <div class="todo done"><span class="box">✓</span><span class="txt">Finish onboarding flow</span><span class="bar"><i style="width:88%"></i></span></div>
+          <div class="todo"><span class="box"></span><span class="txt">Reply to Sam re: pricing</span><span class="bar"><i style="width:34%"></i></span></div>
+          <div class="todo"><span class="box"></span><span class="txt">Read the retention report</span><span class="bar"><i style="width:6%"></i></span></div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-label">Review · 1</div>
+          <div class="review-row">
+            <div class="t"><b>Safari — twitter.com</b><span>19m · guessed: research?</span></div>
+            <span class="chip">Off-track</span><span class="chip ok">✓</span>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-label">Time on goal</div>
+          <div class="goalrow"><span class="nm">Ship the redesign</span><span class="track"><span class="fill" style="width:52%"></span><span class="tgt" style="left:40%"></span></span><span class="pct">52% / 40%</span></div>
+          <div class="goalrow"><span class="nm">Deep work</span><span class="track"><span class="fill" style="width:61%"></span><span class="tgt" style="left:50%"></span></span><span class="pct">61% / 50%</span></div>
+          <div class="goalrow warn"><span class="nm">Customer calls</span><span class="track"><span class="fill" style="width:9%"></span><span class="tgt" style="left:20%"></span></span><span class="pct">9% / 20%</span></div>
+          <div class="week" aria-hidden="true">
+            <i style="height:40%"></i><i style="height:65%"></i><i class="gap"></i><i style="height:55%"></i><i style="height:80%"></i><i style="height:48%"></i><i class="today" style="height:72%"></i>
+          </div>
+        </div>
+
+        <div class="pop-foot">
+          <span class="live">● capture live</span><span>·</span><span>away-pause armed</span><span>·</span><span>3 rules learned</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- the loop -->
+  <div class="loop" id="how" aria-label="The feedback loop">
+    <b>watch</b><span>→</span><b>understand</b><span>→</span><b>score</b><span>→</span><b>nudge</b><span>→</span><b class="you">you adjust</b><span>→ ↺</span>
+  </div>
+
+  <!-- cards -->
+  <section class="cards">
+    <div class="card">
+      <h3>Teach it in one tap</h3>
+      <p>Mislabeled a session? Reassign it, mark it off-track, or call it not-work.
+         The score moves instantly — and three consistent corrections become a rule
+         it applies by itself.</p>
+      <div class="demo">
+        <div style="color:var(--ink-2);margin-bottom:7px">Safari — twitter.com → <b style="color:var(--ink)">Not work</b></div>
+        <div class="flash">score 64 → 72 · rule candidate saved</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>It never fakes a number</h3>
+      <p>Under thirty active minutes, the day reads "insufficient data" — a dash,
+         not a guess. Unknown is unknown. The score only exists when the evidence does.</p>
+      <div class="demo" style="display:flex;align-items:center;gap:13px">
+        <span class="dash">—</span>
+        <span style="color:var(--ink-2)">not enough captured time yet <span style="color:var(--ink-3)">(14m)</span></span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Local first, secrets never</h3>
+      <p>Capture, scoring, and storage stay on your Mac. Keys, cards, and codes are
+         scrubbed before anything is stored — and recording pauses the moment you
+         lock your screen or walk away.</p>
+      <div class="demo redact">
+        deploy with sk-<span class="r">[REDACTED:api-key]</span> then rotate the <span class="r">[REDACTED:credential]</span> before…
+      </div>
+    </div>
+  </section>
+
+  <!-- terminal -->
+  <section class="term-wrap">
+    <div class="term-head">
+      <h2>Three commands to your first scored day</h2>
+      <p>macOS 14+ · Python · works with a free local model, no API key required</p>
+    </div>
+    <div class="term">
+      <div class="term-bar"><i></i><i></i><i></i></div>
+      <pre>
+<span class="c"># clone + set up (venv, engine, menu bar app)</span>
+git clone https://github.com/contains-studio/scoregoals
+cd scoregoals &amp;&amp; ./scripts/setup.sh
+
+<span class="c"># health check — it tells you exactly what's missing</span>
+scoregoals doctor
+<span class="g">✓ screenpipe   ✓ frames   ✓ audio   ✓ a11y text   ✓ ollama</span>
+
+<span class="c"># write your goals, then let the day run</span>
+open goals.md</pre>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="row">
+    <a href="https://github.com/contains-studio/scoregoals">GitHub</a>
+    <a href="https://github.com/contains-studio/scoregoals/blob/main/SETUP.md">Setup guide</a>
+    <a href="https://github.com/contains-studio/scoregoals/blob/main/docs/AGENT_API.md">Agent API</a>
+    <a href="https://github.com/contains-studio/scoregoals/blob/main/LICENSE">MIT license</a>
+  </div>
+  <div>Built on <a href="https://github.com/mediar-ai/screenpipe">screenpipe</a> + <a href="https://ollama.com">Ollama</a>. Your data never leaves your Mac.</div>
+</footer>
+
+<script>
+  // one orchestrated moment: the ring draws and the score counts 0 -> 72,
+  // in the menu bar and the popover together.
+  (function(){
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches){
+      document.getElementById('barnum').textContent='72';
+      document.getElementById('popnum').textContent='72';
+      document.getElementById('barring').style.strokeDashoffset=75.4*(1-.72);
+      return;
+    }
+    var target=72, dur=1100, t0=null;
+    var barnum=document.getElementById('barnum'),
+        popnum=document.getElementById('popnum'),
+        ring=document.getElementById('barring');
+    function tick(ts){
+      if(!t0) t0=ts;
+      var p=Math.min(1,(ts-t0)/dur), e=1-Math.pow(1-p,3), v=Math.round(e*target);
+      barnum.textContent=v; popnum.textContent=v;
+      ring.style.strokeDashoffset=75.4*(1-(e*target/100));
+      if(p<1) requestAnimationFrame(tick);
+    }
+    setTimeout(function(){requestAnimationFrame(tick)}, 900);
+  })();
+</script>
+</body>
+</html>
