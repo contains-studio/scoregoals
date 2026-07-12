@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 
-from ..models import ActivityRecord, Session
+from ..models import ActivityRecord, Session, session_id
 
 # Screen-activity kinds that form sessions. Audio is meeting material and is
 # routed to DayTimeline.meetings by timeline.build, never into sessions.
@@ -195,9 +195,11 @@ def segment(records: list[ActivityRecord]) -> list[Session]:
         app = g["app"] or None
         title = _pick_title(g["items"])
         category = _categorize(app, title)
+        start_iso = g["start"].isoformat(timespec="seconds")
         sessions.append(
             Session(
-                start=g["start"].isoformat(timespec="seconds"),
+                id=session_id(start_iso[:10], start_iso, app),
+                start=start_iso,
                 end=g["end"].isoformat(timespec="seconds"),
                 app=app,
                 title=title,

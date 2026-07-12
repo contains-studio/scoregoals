@@ -41,6 +41,9 @@ regardless; `--date YYYY-MM-DD` overrides the default (today).
 | `score` | object | day score (see below) |
 | `goals` | array of object | per-goal alignment incl. an `unaligned` entry |
 | `drift_flags` | array of string | deterministic drift warnings (may be empty) |
+| `review` | object | `{ "needs_review": int }` — low-confidence sessions awaiting a correction today (see `review`) |
+| `corrections_this_week` | int | count of user labels applied in the 7-day window ending `date` |
+| `learning` | object | learning KPI surface (see below) |
 | `intentions` | object | today's intentions block (same shape as `today --json`) |
 | `focus` | object | focus block (same shape as `focus --json`) |
 | `next_event` | object \| null | next upcoming calendar event, or null |
@@ -70,11 +73,19 @@ null/0/false.
 
 ### `score` — day score
 
+Scoring now applies the correction/learning layer (`scoregoals/align.py`): user
+labels and learned rules override keyword matches, and `not_work` sessions are
+excluded from active minutes entirely (see the review section). **Min-data
+guard:** below **30** active captured minutes the day is *unscored* — `overall`
+is `null` and `scored` is `false` (honest uncertainty; unknown ≠ off-track). The
+Swift app must treat `overall` as **nullable** and gate on `scored`.
+
 | field | type | notes |
 |------|------|------|
-| `overall` | int 0–100 | deterministic `compare.align.overall_score` (matches the EOD report) |
-| `on_track` | bool | `overall >= 60` |
-| `active_minutes` | number | `timeline.stats.total_active_minutes` |
+| `overall` | int 0–100 **\| null** | day score; `null` when `scored` is `false` (< 30 active min). When non-null it matches `review`'s score and the EOD report |
+| `scored` | bool | `false` => insufficient captured data (< 30 active min); `overall` is then `null` |
+| `on_track` | bool | `scored && overall != null && overall >= 60` (always `false` when unscored) |
+| `active_minutes` | number | active minutes **after** excluding `not_work` sessions |
 
 ### `goals[]` — per-goal alignment
 
@@ -88,6 +99,27 @@ One entry per goal in `goals.md` order, **plus a trailing `unaligned` entry**.
 | `pct_time` | number | % of active time (0 when the day is empty) |
 | `target_pct` | number \| null | from `goals.md`; null when untargeted (incl. `unaligned`) |
 | `on_track` | bool | `target_pct is null` or `pct_time >= 0.7 * target_pct` |
+
+### `review` and `learning`
+
+Surfaced so the menu bar can show the correction backlog and the learning KPI
+without a second call.
+
+`review`:
+
+| field | type | notes |
+|------|------|------|
+| `needs_review` | int | sessions today whose assignment is a keyword guess or unmatched (i.e. not settled by a user label or a learned rule) — the count the Review pane badges |
+
+`corrections_this_week` (top level): int — user labels applied in the 7-day
+window ending `date`. The learning KPI is "this trends toward zero".
+
+`learning`:
+
+| field | type | notes |
+|------|------|------|
+| `active_rules` | int | number of active learned rules in `data/learned_rules.json` |
+| `corrections_by_week` | array of object | `[{ "week": "2026-W28", "count": int }, …]`, oldest ISO-week first; the correction-rate trend |
 
 ### `intentions`
 
@@ -149,7 +181,7 @@ scheduled, or the day's events are all in the past). Otherwise:
     "on_task": false, "category": null, "since": null, "minutes": 0.0,
     "source": "unknown"
   },
-  "score": { "overall": 75, "on_track": true, "active_minutes": 304.0 },
+  "score": { "overall": 75, "scored": true, "on_track": true, "active_minutes": 304.0 },
   "goals": [
     { "goal_id": "ship-scoregoals", "goal_name": "Ship scoregoals", "minutes": 131.0, "pct_time": 43.1, "target_pct": 35.0, "on_track": true },
     { "goal_id": "deep-work-coding", "goal_name": "Deep work / coding", "minutes": 0.0, "pct_time": 0.0, "target_pct": 50.0, "on_track": false },
@@ -158,6 +190,9 @@ scheduled, or the day's events are all in the past). Otherwise:
     { "goal_id": "unaligned", "goal_name": "Unaligned", "minutes": 32.0, "pct_time": 10.5, "target_pct": null, "on_track": true }
   ],
   "drift_flags": [ "No time on 'Deep work / coding' (target 50%)" ],
+  "review": { "needs_review": 3 },
+  "corrections_this_week": 1,
+  "learning": { "active_rules": 2, "corrections_by_week": [ { "week": "2026-W27", "count": 5 }, { "week": "2026-W28", "count": 1 } ] },
   "intentions": { "date": "2026-07-11", "set_at": null, "items": [], "history_summary": { "days": 7, "completion_rate": 0.0 } },
   "focus": { "active": false, "goal_id": null, "goal_name": null, "started_at": null, "until": null },
   "next_event": null,
@@ -389,3 +424,96 @@ content parses to zero goals it is still written and a warning goes to stderr
   ]
 }
 ```
+
+---
+
+## `scoregoals review [--date YYYY-MM-DD] [--json]`
+
+The Review & Correct surface: every session for the day resolved to a verdict,
+**uncertain-first** (sessions needing review come first, biggest minutes first —
+the Review pane renders top-down). Read-only. Without `--json` a human table is
+printed; `--json` emits the object below. When no timeline exists for the date,
+`sessions` is `[]` and `score.overall` is `null`.
+
+| field | type | notes |
+|------|------|------|
+| `date` | string `YYYY-MM-DD` | the day reviewed |
+| `score` | object | `{ "overall": int\|null, "scored": bool, "active_minutes": number }` — same guard as `status.score` |
+| `needs_review` | int | count of `sessions[]` with `needs_review == true` |
+| `sessions` | array of object | one per session, uncertain-first (see below) |
+
+`sessions[]`:
+
+| field | type | notes |
+|------|------|------|
+| `id` | string | stable 12-hex session id (`models.session_id`); the handle `label` takes |
+| `start` / `end` | string (ISO, may be naive local) | session bounds |
+| `span` | string | `"HH:MM-HH:MM"` convenience form of start–end |
+| `app` | string \| null | foreground app |
+| `title` | string \| null | window title |
+| `minutes` | number | session duration |
+| `goal_id` | string \| null | resolved **active** goal id; null for `off_track`/`not_work`/unmatched or a verdict naming an archived goal |
+| `goal_name` | string \| null | display name of `goal_id` |
+| `verdict` | string \| null | goal id, `"off_track"`, `"not_work"`, or `null` (unmatched) |
+| `confidence` | number 0–1 | `1.0` label · `0.9` rule · `0.6` keyword (`0.4` on a keyword collision) · `0.2` none |
+| `verdict_source` | string | `"label"` \| `"rule"` \| `"keyword"` \| `"none"` — authority that set the verdict |
+| `needs_review` | bool | `true` unless the verdict came from a user `label` or a learned `rule` |
+
+## `scoregoals label <session-id> (--goal <id> | --off-track | --not-work | --confirm)`
+
+Appends one **user** correction for the session to `data/labels.jsonl`, then
+recomputes and prints the day delta: `labeled <id> → <verdict>   score 66 -> 71`
+(each side is the integer score, or `insufficient data` when unscored). Exactly
+one of the four verdict flags is required; `--confirm` accepts the session's
+current resolved assignment (no-op on the number, but promotes it to an
+authoritative label). `--date` defaults to today; the id may be a unique prefix.
+Exit 2 (stderr message, no mutation) for an unknown session id, unknown
+`--goal` id, or `--confirm` on a session with no current assignment.
+
+- `--off-track` → verdict `off_track`: worked, but on no goal (counts as active,
+  attributed to `unaligned`).
+- `--not-work` → verdict `not_work`: out of scope — **excluded from active
+  minutes and every goal computation** (personal time is not penalized).
+
+## `scoregoals learn`
+
+Mines consistent corrections into deterministic rules (see
+`data/learned_rules.json` below) and prints a one-line summary plus the promoted
+and retired rules:
+
+```
+scoregoals learn — 1 promoted, 0 retired, 1 active rule(s)
+  + SynthApp · title~widget → off_track  (from 3 labels)
+```
+
+A pattern `(app, dominant title token) → verdict` promotes when its **latest**
+user labels are ≥ 3, unanimous, and (for goal verdicts) the goal is still
+active. A rule retires (`contradicted`) the moment a later label disagrees, or
+(`archived-goal`) when its goal is archived/removed. Rules apply in `align.py`
+**before** any keyword/LLM guess.
+
+---
+
+## Data model additions (`schema_version` unchanged — additive)
+
+**`Session.id`** (`scoregoals/models.py`) — new `string` field on every session,
+a stable 12-hex `sha1(date|start|app)[:12]` (`models.session_id`). Set during
+segmentation and round-tripped through `to_json`/`from_json`; stable across
+rebuilds of the same timeline. Sessions in timelines captured before ids existed
+decode with `id == ""` and are re-derived on the fly by `review`/`label`.
+
+**`Report.scored`** (`scoregoals/models.py`) — new `bool` field, default `true`.
+`false` marks an insufficient-data day (< 30 active minutes). In that case the
+deterministic score written to `data/benchmarks/compare.csv` is the sentinel
+**`overall_score = -1`** (documented so consumers of the CSV don't mistake it for
+a real 0). Scored days carry the real 0–100 value as before.
+
+**`data/labels.jsonl`** — append-only correction store, one JSON object per line:
+`{ ts, session_id, date, fingerprint: { app, title_tokens, text_keywords,
+hour_bucket }, verdict: goal_id|"off_track"|"not_work", source: "user"|"implicit" }`.
+Latest line per `session_id` wins. Malformed lines are skipped with a warning.
+
+**`data/learned_rules.json`** — `{ "rules": [...], "retired": [...] }`. Each rule:
+`{ "rule": { "app", "title_token", "verdict" }, "created_from": [{ session_id, ts }],
+"created_at" }`. Retired entries add `"reason"` (`contradicted`|`archived-goal`)
+and `"retired_at"`.

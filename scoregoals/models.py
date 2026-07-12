@@ -14,6 +14,7 @@ Conventions:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,6 +28,7 @@ __all__ = [
     "GoalAlignment",
     "Report",
     "iso_now",
+    "session_id",
     "to_dict",
     "to_json",
     "from_json",
@@ -38,6 +40,19 @@ __all__ = [
 def iso_now() -> str:
     """Current local time as an ISO-8601 string with UTC offset."""
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def session_id(date: str, start: str, app: str | None) -> str:
+    """Stable short id for a session: 12-hex sha1 of date+start+app.
+
+    Deterministic — the same (date, start, app) always yields the same id, so a
+    session keeps its id across rebuilds of the same timeline. This id keys the
+    labels store (labels.py) and the review/label CLI. `date` is the session's
+    YYYY-MM-DD day; `start` its ISO start; `app` the (possibly None) foreground
+    app.
+    """
+    raw = f"{date or ''}|{start or ''}|{app or ''}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass
@@ -58,6 +73,7 @@ class ActivityRecord:
 class Session:
     """A contiguous block of related activity, produced by aggregate/segment.py."""
 
+    id: str = ""            # stable short id, see session_id(date, start, app)
     start: str = ""
     end: str = ""
     app: str | None = None
@@ -119,7 +135,8 @@ class Report:
     model: str = ""
     narrative: str = ""
     alignments: list[GoalAlignment] = field(default_factory=list)
-    overall_score: int = 0  # 0-100
+    overall_score: int = 0  # 0-100; meaningless when scored is False (see below)
+    scored: bool = True  # False => insufficient captured data (< MIN_ACTIVE_MINUTES)
     drift_flags: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     tokens_in: int = 0

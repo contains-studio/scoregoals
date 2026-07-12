@@ -339,24 +339,43 @@ def build(config: Config, date: str) -> dict:
 
     timeline = _load_or_build_timeline(config, date, warnings)
 
+    # Corrected scoring: user labels + learned rules override keyword matches,
+    # not_work sessions are excluded, and below MIN_ACTIVE_MINUTES the day is
+    # unscored (overall=null, scored=false) — honest uncertainty.
     try:
-        alignments = align.align(timeline, goals)
+        from . import labels as labels_mod
+
+        all_labels = labels_mod.load_labels(config)
+        labels_by_id = labels_mod.labels_by_session(config, labels=all_labels)
     except Exception as exc:
-        _warn(warnings, f"alignment failed ({exc})")
-        alignments = []
+        _warn(warnings, f"labels not loaded ({exc})")
+        all_labels, labels_by_id = [], {}
 
     try:
-        overall = align.overall_score(alignments)
-    except Exception as exc:
-        _warn(warnings, f"score failed ({exc})")
-        overall = 0
+        from . import learn as learn_mod
 
+        rules = learn_mod.active_rules(config)
+    except Exception as exc:
+        _warn(warnings, f"learned rules not loaded ({exc})")
+        rules = []
+
+    from . import align as align_mod
+
+    scored = True
     stats = timeline.stats if isinstance(timeline.stats, dict) else {}
-    active_minutes = 0.0
     try:
-        active_minutes = round(float(stats.get("total_active_minutes", 0) or 0), 1)
-    except (TypeError, ValueError):
-        active_minutes = 0.0
+        day = align_mod.score_day(timeline, goals, labels_by_id, rules)
+        alignments = day["alignments"]
+        overall = day["overall"]
+        scored = day["scored"]
+        active_minutes = day["active_minutes"]
+    except Exception as exc:
+        _warn(warnings, f"scoring failed ({exc})")
+        alignments, overall, scored = [], None, False
+        try:
+            active_minutes = round(float(stats.get("total_active_minutes", 0) or 0), 1)
+        except (TypeError, ValueError):
+            active_minutes = 0.0
 
     goals_out = [
         {
@@ -369,6 +388,20 @@ def build(config: Config, date: str) -> dict:
         }
         for a in alignments
     ]
+
+    try:
+        review_rows = align_mod.resolve_day(timeline, goals, labels_by_id, rules)
+        needs_review = sum(1 for r in review_rows if r["needs_review"])
+    except Exception as exc:
+        _warn(warnings, f"review summary failed ({exc})")
+        needs_review = 0
+
+    try:
+        corrections_week = labels_mod.corrections_in_week(all_labels, date)
+        corr_by_week = labels_mod.corrections_by_week(all_labels)
+    except Exception as exc:
+        _warn(warnings, f"corrections rollup failed ({exc})")
+        corrections_week, corr_by_week = 0, []
 
     try:
         drift = align.drift_flags(timeline, goals, alignments)
@@ -411,11 +444,15 @@ def build(config: Config, date: str) -> dict:
         "now": now,
         "score": {
             "overall": overall,
-            "on_track": overall >= ON_TRACK_SCORE,
+            "scored": scored,
+            "on_track": bool(scored and overall is not None and overall >= ON_TRACK_SCORE),
             "active_minutes": active_minutes,
         },
         "goals": goals_out,
         "drift_flags": drift,
+        "review": {"needs_review": needs_review},
+        "corrections_this_week": corrections_week,
+        "learning": {"active_rules": len(rules), "corrections_by_week": corr_by_week},
         "intentions": intentions_block,
         "focus": focus_block,
         "next_event": next_event,

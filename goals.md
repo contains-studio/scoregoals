@@ -22,8 +22,8 @@ Notes:
 - Edit freely; changes apply on the next capture/analyze run.
 -->
 
-## Goal: Ship dayloop
-keywords: dayloop, screenpipe, ollama, python, vs code, vscode, pytest, cli, sqlite
+## Goal: Ship ScoreGoals
+keywords: scoregoals, dayloop, screenpipe, ollama, python, vs code, vscode, pytest, cli, sqlite
 target_pct: 35
 Get the dayloop cybernetic tracker to a daily-usable v1: live capture via
 screenpipe, nightly end-of-day reports, morning plans, and the

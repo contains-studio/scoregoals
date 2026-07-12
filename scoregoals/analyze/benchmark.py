@@ -16,6 +16,10 @@ from pathlib import Path
 from ..config import Config
 from ..models import DayTimeline, Goal, GoalAlignment, Report
 
+# Sentinel written to the compare.csv overall_score column when a day is below
+# the min-data threshold (Report.scored is False). Documented in STATUS_SCHEMA.md.
+INSUFFICIENT_DATA_SCORE = -1
+
 # compare.csv column order — keep in sync with append_csv().
 CSV_COLUMNS = [
     "date",
@@ -55,10 +59,21 @@ def run(
     self-reported values are preserved in raw for transparency.
     Returns the Reports in backend order.
     """
+    from ..align import MIN_ACTIVE_MINUTES
     from ..compare import align
 
     det_score = align.overall_score(alignments)
     det_flags = align.drift_flags(timeline, goals, alignments)
+
+    # Min-data guard: below MIN_ACTIVE_MINUTES of captured active time the day is
+    # unscored. Report.scored records this; the compare.csv overall_score column
+    # then carries the documented sentinel -1 (see docs/STATUS_SCHEMA.md).
+    try:
+        active_minutes = float((timeline.stats or {}).get("total_active_minutes", 0) or 0)
+    except (TypeError, ValueError):
+        active_minutes = 0.0
+    day_scored = active_minutes >= MIN_ACTIVE_MINUTES
+    csv_score = det_score if day_scored else INSUFFICIENT_DATA_SCORE
 
     reports: list[Report] = []
     for backend in backends:
@@ -82,7 +97,8 @@ def run(
         rpt.raw = dict(rpt.raw or {})
         rpt.raw["llm_overall_score"] = rpt.overall_score
         rpt.raw["llm_drift_flags"] = list(rpt.drift_flags)
-        rpt.overall_score = det_score
+        rpt.overall_score = csv_score
+        rpt.scored = day_scored
         rpt.drift_flags = list(det_flags)
         reports.append(rpt)
     return reports

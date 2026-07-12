@@ -185,6 +185,190 @@ def cmd_mock(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- review / label / learn (correction + learning loop) ---------------------
+
+
+def _load_day_for_review(cfg: Config, date: str):
+    """(timeline|None, goals, labels_by_id, rules) for a date."""
+    from . import labels as labels_mod
+    from . import learn as learn_mod
+    from .compare import align as kw_align
+    from .store import load_timeline
+
+    tl = load_timeline(cfg, date)
+    goals = kw_align.load_goals(cfg)
+    labels_by_id = labels_mod.labels_by_session(cfg)
+    rules = learn_mod.active_rules(cfg)
+    return tl, goals, labels_by_id, rules
+
+
+def _span(start: str | None, end: str | None) -> str:
+    return f"{(start or '')[11:16]}-{(end or '')[11:16]}"
+
+
+def _fmt_score(v) -> str:
+    return "insufficient data" if v is None else str(v)
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """review [--date] [--json]: per-session assignments, uncertain-first."""
+    cfg = _cfg(args)
+    from . import align as align_mod
+
+    d = getattr(args, "date", None) or _today()
+    tl, goals, labels_by_id, rules = _load_day_for_review(cfg, d)
+    if tl is None:
+        if getattr(args, "json", False):
+            _print_json({"date": d, "score": {"overall": None, "scored": False,
+                         "active_minutes": 0.0}, "needs_review": 0, "sessions": []})
+        else:
+            print(f"scoregoals: no timeline captured for {d}")
+        return 0
+
+    rows = align_mod.resolve_day(tl, goals, labels_by_id, rules)
+    score = align_mod.score_day(tl, goals, labels_by_id, rules)
+    needs = sum(1 for r in rows if r["needs_review"])
+
+    if getattr(args, "json", False):
+        _print_json(
+            {
+                "date": d,
+                "score": {
+                    "overall": score["overall"],
+                    "scored": score["scored"],
+                    "active_minutes": score["active_minutes"],
+                },
+                "needs_review": needs,
+                "sessions": [
+                    {
+                        "id": r["session_id"],
+                        "start": r["start"],
+                        "end": r["end"],
+                        "span": _span(r["start"], r["end"]),
+                        "app": r["app"],
+                        "title": r["title"],
+                        "minutes": r["minutes"],
+                        "goal_id": r["goal_id"],
+                        "goal_name": r["goal_name"],
+                        "verdict": r["verdict"],
+                        "confidence": r["confidence"],
+                        "verdict_source": r["source"],
+                        "needs_review": r["needs_review"],
+                    }
+                    for r in rows
+                ],
+            }
+        )
+        return 0
+
+    print(f"scoregoals review — {d}   score {_fmt_score(score['overall'])}"
+          f"   active {score['active_minutes']:.0f}m   {needs} need review")
+    print(f"  {'id':<12} {'span':<11} {'min':>4} {'src':<7} {'conf':>4} {'?':<1} {'assignment':<24} app/title")
+    for r in rows:
+        assign = r["goal_name"] or (r["verdict"] or "—")
+        flag = "!" if r["needs_review"] else " "
+        who = (r["app"] or "?")
+        if r["title"]:
+            who += f" · {r['title']}"
+        print(f"  {r['session_id']:<12} {_span(r['start'], r['end']):<11} {r['minutes']:>4.0f}"
+              f" {r['source']:<7} {r['confidence']:>4.1f} {flag:<1} {assign[:24]:<24} {who[:40]}")
+    return 0
+
+
+def _resolve_session_by_id(tl, ref: str, date: str):
+    """Find the session whose id equals `ref` (or uniquely prefixes it)."""
+    from .align import resolve_session  # noqa: F401 (ensures package import)
+    from .labels import session_id_for
+
+    exact = [s for s in tl.sessions if session_id_for(s, date) == ref]
+    if exact:
+        return exact[0], session_id_for(exact[0], date)
+    pref = [s for s in tl.sessions if session_id_for(s, date).startswith(ref)]
+    if len(pref) == 1:
+        return pref[0], session_id_for(pref[0], date)
+    return None, None
+
+
+def cmd_label(args: argparse.Namespace) -> int:
+    """label <session-id> (--goal ID | --off-track | --not-work | --confirm)."""
+    cfg = _cfg(args)
+    from . import align as align_mod
+    from . import labels as labels_mod
+    from . import learn as learn_mod
+    from .compare import align as kw_align
+    from .labels import NOT_WORK, OFF_TRACK
+    from .store import load_timeline
+
+    d = getattr(args, "date", None) or _today()
+    tl = load_timeline(cfg, d)
+    if tl is None:
+        print(f"scoregoals: no timeline captured for {d}", file=sys.stderr)
+        return 2
+
+    session, sid = _resolve_session_by_id(tl, args.session_id, d)
+    if session is None:
+        print(f"scoregoals: no session matching {args.session_id!r} on {d}"
+              " (run `scoregoals review` to list ids)", file=sys.stderr)
+        return 2
+
+    goals = kw_align.load_goals(cfg)
+    labels_by_id = labels_mod.labels_by_session(cfg)
+    rules = learn_mod.active_rules(cfg)
+
+    # Determine the verdict to record.
+    if args.goal is not None:
+        goal_ids = {g.id for g in goals}
+        if args.goal not in goal_ids:
+            print(f"scoregoals: unknown goal id {args.goal!r}; known: "
+                  f"{', '.join(sorted(goal_ids)) or '(none)'}", file=sys.stderr)
+            return 2
+        verdict = args.goal
+    elif args.off_track:
+        verdict = OFF_TRACK
+    elif args.not_work:
+        verdict = NOT_WORK
+    else:  # --confirm: accept the current resolved assignment
+        cur = align_mod.resolve_session(session, goals, labels_by_id, rules, date=d)
+        if cur["verdict"] is None:
+            print("scoregoals: nothing to confirm — this session has no current "
+                  "assignment; use --goal/--off-track/--not-work", file=sys.stderr)
+            return 2
+        verdict = cur["verdict"]
+
+    before = align_mod.score_day(tl, goals, labels_by_id, rules)["overall"]
+    labels_mod.record_label(
+        cfg, sid, d, labels_mod.fingerprint_for_session(session), verdict, source="user"
+    )
+    labels_by_id = labels_mod.labels_by_session(cfg)  # reload with the new label
+    after = align_mod.score_day(tl, goals, labels_by_id, rules)["overall"]
+
+    verdict_label = next((g.name for g in goals if g.id == verdict), verdict)
+    print(f"labeled {sid} → {verdict_label}   score {_fmt_score(before)} -> {_fmt_score(after)}")
+    return 0
+
+
+def cmd_learn(args: argparse.Namespace) -> int:
+    """learn: mine consistent corrections into rules; print promoted/retired."""
+    cfg = _cfg(args)
+    from . import learn as learn_mod
+    from .compare import align as kw_align
+
+    goals = kw_align.load_goals(cfg)
+    res = learn_mod.mine(cfg, goals)
+    promoted, retired = res["promoted"], res["retired"]
+    print(f"scoregoals learn — {len(promoted)} promoted, {len(retired)} retired,"
+          f" {len(res['rules'])} active rule(s)")
+    for r in promoted:
+        p = r["rule"]
+        tok = f" · title~{p['title_token']}" if p.get("title_token") else ""
+        print(f"  + {p['app']}{tok} → {p['verdict']}  (from {len(r['created_from'])} labels)")
+    for r in retired:
+        p = r["rule"]
+        tok = f" · title~{p['title_token']}" if p.get("title_token") else ""
+        print(f"  - {p['app']}{tok} → {p['verdict']}  ({r.get('reason', 'retired')})")
+    return 0
+
+
 # --- status / today / focus / config (menu bar app surface) ------------------
 
 
@@ -769,6 +953,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
     p.add_argument("--date", metavar="YYYY-MM-DD", help="default: today")
     p.set_defaults(func=cmd_status)
+
+    # review / label / learn — correction + learning loop ----------------------
+    p = sub.add_parser("review", help="per-session goal assignments, uncertain-first")
+    p.add_argument("--date", metavar="YYYY-MM-DD", help="default: today")
+    p.add_argument("--json", action="store_true", help="emit the review block as JSON")
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("label", help="correct one session's assignment (recomputes the day)")
+    p.add_argument("session_id", metavar="SESSION-ID", help="id (or unique prefix) from `review`")
+    p.add_argument("--date", metavar="YYYY-MM-DD", help="default: today")
+    grp = p.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--goal", metavar="GOAL-ID", help="assign to this goal id")
+    grp.add_argument("--off-track", dest="off_track", action="store_true",
+                     help="worked, but on no goal")
+    grp.add_argument("--not-work", dest="not_work", action="store_true",
+                     help="out of scope: excluded from active minutes")
+    grp.add_argument("--confirm", action="store_true", help="accept the current assignment")
+    p.set_defaults(func=cmd_label, goal=None, off_track=False, not_work=False, confirm=False)
+
+    p = sub.add_parser("learn", help="mine consistent corrections into deterministic rules")
+    p.set_defaults(func=cmd_learn)
 
     # today — daily intentions -------------------------------------------------
     p_today = sub.add_parser("today", help="daily intentions (up to 3, time-attributed)")
