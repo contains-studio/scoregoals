@@ -45,6 +45,7 @@ MIN_ACTIVE_MINUTES = 30.0
 
 CONF_LABEL = 1.0
 CONF_SYSTEM = 0.95  # curated macOS system surfaces -> not_work, no review needed
+CONF_IMPLICIT = 0.7  # unreviewed completed day = weak acceptance of the guess
 CONF_RULE = 0.9
 
 # macOS system surfaces that can never be "work": permission prompts, the lock
@@ -111,9 +112,18 @@ def resolve_session(
     if label is None and labels_by_fp:
         # Id didn't match (re-segmentation jitter) — try the fingerprint fallback.
         label = match_label_by_fingerprint(session, labels_by_fp)
+    if (label is not None and str(label.get("source")) == "implicit"
+            and date and str(label.get("date")) != str(date)):
+        # Implicit acceptance is a weak, same-day signal: it must never settle a
+        # DIFFERENT day's session via the fingerprint fallback.
+        label = None
     if label is not None:
         verdict = str(label.get("verdict"))
-        source, confidence = "label", CONF_LABEL
+        if str(label.get("source")) == "implicit":
+            # A completed, never-corrected day: weak acceptance, no review needed.
+            source, confidence = "implicit", CONF_IMPLICIT
+        else:
+            source, confidence = "label", CONF_LABEL
     elif (session.app or "").strip() in SYSTEM_NOISE_APPS:
         # macOS system surfaces (permission prompts, the lock screen, the
         # screensaver) are never "work" — learned the hard way when an overnight
@@ -141,10 +151,10 @@ def resolve_session(
         "goal_name": goal.name if goal else None,
         "source": source,
         "confidence": round(confidence, 2),
-        # High-authority signals (a user label, a promoted rule, or a known
-        # system surface) are settled; keyword guesses and unmatched sessions
-        # surface for review.
-        "needs_review": source not in ("label", "rule", "system"),
+        # Settled signals (user label, implicit acceptance of a completed day,
+        # a promoted rule, or a known system surface) skip review; live keyword
+        # guesses and unmatched sessions surface for it.
+        "needs_review": source not in ("label", "implicit", "rule", "system"),
     }
 
 

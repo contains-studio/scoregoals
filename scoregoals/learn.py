@@ -51,7 +51,12 @@ __all__ = [
 ]
 
 RULES_FILENAME = "learned_rules.json"
-MIN_SUPPORT = 3  # a pattern needs this many consistent labels to promote
+MIN_SUPPORT = 3  # a pattern needs this many consistent USER labels to promote
+# Implicit acceptances (unreviewed completed days) are weak signal: a pattern
+# with fewer than MIN_SUPPORT user labels can still promote, but only at this
+# higher combined bar, and implicit votes only count when they agree with the
+# user votes (or are unanimous when no user vote exists).
+MIN_SUPPORT_IMPLICIT = 5
 _SPECIAL = (OFF_TRACK, NOT_WORK)
 
 
@@ -137,8 +142,14 @@ def mine(config: Config, goals: list[Goal]) -> dict:
     # vote toward its fingerprint pattern.
     latest_by_session: dict[str, dict] = {}
     for l in load_labels(config):
-        if l.get("source") == "user":
-            latest_by_session[str(l.get("session_id"))] = l
+        src = l.get("source")
+        if src not in ("user", "implicit"):
+            continue
+        sid = str(l.get("session_id"))
+        prev = latest_by_session.get(sid)
+        if prev is not None and prev.get("source") == "user" and src == "implicit":
+            continue  # a user correction is never superseded by weak acceptance
+        latest_by_session[sid] = l
     labels = list(latest_by_session.values())
     active_goal_ids = {g.id for g in goals}  # load_goals returns active goals only
 
@@ -176,13 +187,30 @@ def mine(config: Config, goals: list[Goal]) -> dict:
                 newly_retired.append(_retire(prior, "app-only-too-broad"))
             continue
 
-        if len(verdicts) > 1:
-            # Contradicted pattern: never a rule; retire any active one.
+        user_items = [i for i in items if i.get("source") == "user"]
+        imp_items = [i for i in items if i.get("source") == "implicit"]
+        user_verdicts = {str(i.get("verdict")) for i in user_items}
+
+        if len(user_verdicts) > 1:
+            # Users contradicting themselves: never a rule; retire any active one.
             if prior is not None:
                 newly_retired.append(_retire(prior, "contradicted"))
             continue
 
-        verdict = next(iter(verdicts))
+        if user_items:
+            verdict = next(iter(user_verdicts))
+            # implicit votes only reinforce, never outvote
+            support = len(user_items) + sum(
+                1 for i in imp_items if str(i.get("verdict")) == verdict
+            )
+            enough = len(user_items) >= MIN_SUPPORT or support >= MIN_SUPPORT_IMPLICIT
+        else:
+            # Implicit-only pattern: must be unanimous and clear the higher bar.
+            if len(verdicts) > 1:
+                continue  # weak signal disagreeing with itself: wait, don't retire
+            verdict = next(iter(verdicts))
+            enough = len(imp_items) >= MIN_SUPPORT_IMPLICIT
+
         if not _goal_ok(verdict):
             if prior is not None:
                 newly_retired.append(_retire(prior, "archived-goal"))
@@ -190,7 +218,7 @@ def mine(config: Config, goals: list[Goal]) -> dict:
 
         if prior is not None:
             new_active[ks] = prior  # already promoted, still consistent — keep
-        elif len(items) >= MIN_SUPPORT:
+        elif enough:
             rule = {
                 "rule": {"app": g["app"], "title_token": g["token"], "verdict": verdict},
                 "created_from": [
@@ -224,3 +252,44 @@ def mine(config: Config, goals: list[Goal]) -> dict:
     path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     return {"promoted": promoted, "retired": newly_retired, "rules": out["rules"]}
+
+
+def accept_day(config: Config, date: str) -> dict:
+    """Record implicit acceptances for a COMPLETED day.
+
+    Every session whose displayed assignment was a live keyword guess — and that
+    the user never corrected — becomes a weak `source="implicit"` label: the day
+    ended, the guess stood, silence is (soft) agreement. This is how the system
+    keeps learning on days the user never opens the review pane. Idempotent:
+    sessions that already carry any label are skipped.
+
+    Returns {"added": int, "skipped": int}.
+    """
+    from . import align as align_mod
+    from . import labels as labels_mod
+    from .compare import align as kw_align
+    from .store import load_timeline
+
+    tl = load_timeline(config, date)
+    if tl is None:
+        return {"added": 0, "skipped": 0}
+    goals = kw_align.load_goals(config)
+    labels_by_id = labels_mod.labels_by_session(config)
+    labels_by_fp = labels_mod.labels_by_fingerprint(config)
+    rules = active_rules(config)
+    already = {str(l.get("session_id")) for l in labels_mod.load_labels(config)}
+
+    added = skipped = 0
+    for sess in tl.sessions:
+        r = align_mod.resolve_session(
+            sess, goals, labels_by_id, rules, date=date, labels_by_fp=labels_by_fp
+        )
+        if r["source"] != "keyword" or not r["verdict"] or r["session_id"] in already:
+            skipped += 1
+            continue
+        labels_mod.record_label(
+            config, r["session_id"], date,
+            labels_mod.fingerprint_for_session(sess), r["verdict"], source="implicit",
+        )
+        added += 1
+    return {"added": added, "skipped": skipped}

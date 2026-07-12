@@ -111,6 +111,20 @@ def cmd_report(args: argparse.Namespace) -> int:
     out.write_text(md, encoding="utf-8")
     score_str = f"{rpt.overall_score}/100" if rpt.scored else "insufficient data"
     print(f"eod report: {out} (score {score_str}, backend {rpt.backend})")
+
+    # The EOD report closes the day: uncorrected keyword guesses become weak
+    # implicit labels, and the miner runs — the loop learns nightly by itself.
+    try:
+        from . import learn as learn_mod
+        from .compare import align as kw_align
+        acc = learn_mod.accept_day(cfg, args.date)
+        if acc["added"]:
+            print(f"accepted {acc['added']} unreviewed session(s) as implicit signal")
+        for r in learn_mod.mine(cfg, kw_align.load_goals(cfg))["promoted"]:
+            p = r["rule"]
+            print(f"learned: + {p['app']} · title~{p['title_token']} → {p['verdict']}")
+    except Exception as exc:
+        print(f"warning: implicit-accept/mining skipped ({exc})", file=sys.stderr)
     if cfg.icloud_mirror:
         mirror = Path(cfg.icloud_mirror).expanduser()
         try:
@@ -397,6 +411,11 @@ def cmd_learn(args: argparse.Namespace) -> int:
     from .compare import align as kw_align
 
     goals = kw_align.load_goals(cfg)
+    accept = getattr(args, "accept_day", None)
+    if accept:
+        acc = learn_mod.accept_day(cfg, accept)
+        print(f"accepted {acc['added']} unreviewed session(s) from {accept}"
+              f" as implicit signal ({acc['skipped']} already settled/skipped)")
     res = learn_mod.mine(cfg, goals)
     promoted, retired = res["promoted"], res["retired"]
     print(f"scoregoals learn — {len(promoted)} promoted, {len(retired)} retired,"
@@ -1178,6 +1197,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_label, goal=None, off_track=False, not_work=False, confirm=False)
 
     p = sub.add_parser("learn", help="mine consistent corrections into deterministic rules")
+    p.add_argument("--accept-day", metavar="DATE", default=None,
+                   help="first record implicit acceptances for this completed day"
+                        " (unreviewed keyword guesses become weak labels)")
     p.set_defaults(func=cmd_learn)
 
     # today — daily intentions -------------------------------------------------
