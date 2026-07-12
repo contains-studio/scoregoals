@@ -6,10 +6,13 @@ times with zero contradictions** is promoted to a deterministic rule in
 align.py), cite the labels that created them, and **retire automatically** when
 a later label contradicts them or when their goal is archived/removed.
 
-The mined pattern is ``(app, dominant title token) -> verdict``. When a
-session's dominant title token is empty (many windowless sessions), the pattern
-degrades to an app-only rule (``title_token: ""``) — still gated behind the same
->= 3 consistent, zero-contradiction bar.
+The mined pattern is ``(app, dominant title token) -> verdict``. The title
+token MUST be a real discriminating token: an app-only pattern (empty
+``title_token``) is refused, because a rule with no token matches EVERY session
+of that app and would rewrite a whole app's time from a handful of windowless
+labels (e.g. 3 Chrome ``not_work`` labels deleting all Chrome active minutes).
+Windowless sessions therefore never mint a rule; they still need per-session
+labels.
 
 File shape::
 
@@ -166,6 +169,13 @@ def mine(config: Config, goals: list[Goal]) -> dict:
         verdicts = {str(i.get("verdict")) for i in items}
         prior = active_by_key.get(ks)
 
+        if not str(g["token"]).strip():
+            # App-only pattern (no discriminating title token): never a rule —
+            # it would match every session of the app. Retire any that linger.
+            if prior is not None:
+                newly_retired.append(_retire(prior, "app-only-too-broad"))
+            continue
+
         if len(verdicts) > 1:
             # Contradicted pattern: never a rule; retire any active one.
             if prior is not None:
@@ -195,6 +205,11 @@ def mine(config: Config, goals: list[Goal]) -> dict:
     # Active rules with no labels this run: keep, unless their goal went inactive.
     for ks, prior in active_by_key.items():
         if ks in new_active or any(_key_of(r["rule"]) == ks for r in newly_retired):
+            continue
+        if not str(prior["rule"].get("title_token") or "").strip():
+            # A pre-existing app-only rule with no labels this run — retire it
+            # (the empty-token policy applies to legacy rules too).
+            newly_retired.append(_retire(prior, "app-only-too-broad"))
             continue
         if _goal_ok(str(prior["rule"].get("verdict"))):
             new_active[ks] = prior

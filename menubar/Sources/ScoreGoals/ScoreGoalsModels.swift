@@ -707,6 +707,11 @@ struct ReviewSession: Codable, Identifiable {
         switch verdict {
         case "off_track": return "Off-track"
         case "not_work":  return "Not work"
+        case .some(let v) where !v.isEmpty:
+            // A non-special verdict with no goalName is a goal id the engine no
+            // longer resolves — i.e. an archived/removed goal. Name it honestly
+            // rather than mislabeling it "Unmatched".
+            return "\(v) (archived)"
         default:          return "Unmatched"
         }
     }

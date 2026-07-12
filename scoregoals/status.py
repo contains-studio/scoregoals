@@ -278,8 +278,14 @@ def _build_next_event(config: Config, timeline: DayTimeline, date: str, warnings
         return None
 
 
-def _build_week(config: Config, goals, date: str, today_tl: DayTimeline, warnings: list[str]) -> dict:
-    from .compare import align
+def _build_week(config: Config, goals, date: str, today_tl: DayTimeline,
+                labels_by_id: dict, rules: list, labels_by_fp: dict,
+                warnings: list[str]) -> dict:
+    """Per-day scores for the trailing WEEK_DAYS, using the SAME corrections-aware,
+    min-data-guarded path as the headline (align.score_day) so a day's week cell
+    can never contradict its own score. A day below MIN_ACTIVE_MINUTES (or with
+    no timeline) is None — an empty/short day is unknown, not a zero."""
+    from . import align as align_mod
     from .store import load_timeline
 
     scores: list[int | None] = []
@@ -294,7 +300,9 @@ def _build_week(config: Config, goals, date: str, today_tl: DayTimeline, warning
             if tl is None:
                 scores.append(None)
                 continue
-            scores.append(align.overall_score(align.align(tl, goals)))
+            day = align_mod.score_day(tl, goals, labels_by_id, rules,
+                                      labels_by_fp=labels_by_fp)
+            scores.append(day["overall"] if day["scored"] else None)
         except Exception as exc:
             _warn(warnings, f"week score for {d} failed ({exc})")
             scores.append(None)
@@ -347,9 +355,10 @@ def build(config: Config, date: str) -> dict:
 
         all_labels = labels_mod.load_labels(config)
         labels_by_id = labels_mod.labels_by_session(config, labels=all_labels)
+        labels_by_fp = labels_mod.labels_by_fingerprint(config, labels=all_labels)
     except Exception as exc:
         _warn(warnings, f"labels not loaded ({exc})")
-        all_labels, labels_by_id = [], {}
+        all_labels, labels_by_id, labels_by_fp = [], {}, {}
 
     try:
         from . import learn as learn_mod
@@ -364,7 +373,8 @@ def build(config: Config, date: str) -> dict:
     scored = True
     stats = timeline.stats if isinstance(timeline.stats, dict) else {}
     try:
-        day = align_mod.score_day(timeline, goals, labels_by_id, rules)
+        day = align_mod.score_day(timeline, goals, labels_by_id, rules,
+                                  labels_by_fp=labels_by_fp)
         alignments = day["alignments"]
         overall = day["overall"]
         scored = day["scored"]
@@ -390,7 +400,8 @@ def build(config: Config, date: str) -> dict:
     ]
 
     try:
-        review_rows = align_mod.resolve_day(timeline, goals, labels_by_id, rules)
+        review_rows = align_mod.resolve_day(timeline, goals, labels_by_id, rules,
+                                            labels_by_fp=labels_by_fp)
         needs_review = sum(1 for r in review_rows if r["needs_review"])
     except Exception as exc:
         _warn(warnings, f"review summary failed ({exc})")
@@ -429,7 +440,8 @@ def build(config: Config, date: str) -> dict:
                        "started_at": None, "until": None}
 
     next_event = _build_next_event(config, timeline, date, warnings)
-    week = _build_week(config, goals, date, timeline, warnings)
+    week = _build_week(config, goals, date, timeline, labels_by_id, rules,
+                       labels_by_fp, warnings)
 
     try:
         health = _build_health(config, date, warnings)

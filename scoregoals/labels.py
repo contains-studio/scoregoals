@@ -50,6 +50,8 @@ __all__ = [
     "record_label",
     "load_labels",
     "labels_by_session",
+    "labels_by_fingerprint",
+    "match_label_by_fingerprint",
     "corrections_in_week",
     "corrections_by_week",
 ]
@@ -208,6 +210,63 @@ def labels_by_session(config: Config, labels: list[dict] | None = None) -> dict[
     for rec in records:
         latest[str(rec["session_id"])] = rec
     return latest
+
+
+def labels_by_fingerprint(
+    config: Config, labels: list[dict] | None = None
+) -> dict[tuple[str, int], list[dict]]:
+    """Index labels by (app_lower, hour_bucket) for FALLBACK matching.
+
+    A session's stable id is sha1(date|start|app) — but segmentation can re-run
+    within a day (gap-bridge / micro-flip) and shift a session's `start`, which
+    jitters the id. When that happens a stored label no longer matches by id and
+    would silently orphan. This index lets align.py fall back to a fingerprint
+    match (same app + hour + overlapping title tokens). Records are kept in
+    first-seen (oldest) order per bucket so the latest qualifying label wins.
+    """
+    records = load_labels(config) if labels is None else labels
+    index: dict[tuple[str, int], list[dict]] = {}
+    for rec in records:
+        fp = rec.get("fingerprint") if isinstance(rec, dict) else None
+        if not isinstance(fp, dict):
+            continue
+        app = str(fp.get("app") or "").strip().lower()
+        hb = fp.get("hour_bucket")
+        if not app or not isinstance(hb, int) or hb < 0:
+            continue
+        index.setdefault((app, hb), []).append(rec)
+    return index
+
+
+def match_label_by_fingerprint(
+    session: Session, fp_index: dict[tuple[str, int], list[dict]] | None
+) -> dict | None:
+    """Best label for `session` by fingerprint, or None. Fallback only — used
+    when the session_id doesn't match a stored label (see labels_by_fingerprint).
+
+    Match rule (as specced): same app (case-insensitive) AND same start-hour
+    bucket AND title-token overlap — or, for windowless sessions, both token
+    sets empty (app+hour is then the whole signal). The latest (last-appended)
+    qualifying label in the bucket wins, mirroring last-line-wins for ids.
+    """
+    if not fp_index:
+        return None
+    fp = fingerprint_for_session(session)
+    app = str(fp.get("app") or "").strip().lower()
+    hb = fp.get("hour_bucket")
+    if not app or not isinstance(hb, int) or hb < 0:
+        return None
+    candidates = fp_index.get((app, hb))
+    if not candidates:
+        return None
+    stoks = set(fp.get("title_tokens") or [])
+    best: dict | None = None
+    for rec in candidates:  # oldest-first: keep overwriting so the latest wins
+        rfp = rec.get("fingerprint") if isinstance(rec, dict) else None
+        rtoks = set((rfp or {}).get("title_tokens") or [])
+        if (stoks & rtoks) or (not stoks and not rtoks):
+            best = rec
+    return best
 
 
 def _label_day(rec: dict):

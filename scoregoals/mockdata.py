@@ -1,16 +1,28 @@
-"""scoregoals.mockdata — FROZEN deterministic mock DayTimeline.
+"""scoregoals.mockdata — deterministic mock DayTimeline.
 
 Lets the whole pipeline (alignment, analysis, reports, benchmarks) be built
-and tested WITHOUT screenpipe/icalBuddy installed. Content is fully
-deterministic: same `date` in -> identical timeline out (generated_at is
-pinned to <date>T23:59:00, no randomness, no wall-clock dependence).
+and tested WITHOUT screenpipe/icalBuddy installed. The CONTENT is fully
+deterministic: same `date` in -> identical sessions/calendar/github/meetings
+out (no randomness). Two things are intentionally NOT pinned:
+
+* ``generated_at`` is the real wall-clock time (``iso_now()``), NOT a pinned
+  ``<date>T23:59:00``. Pinning it to end-of-day let a mock write win the
+  newest-wins timeline heal (store/db.py) over a real capture — a mock could
+  silently overwrite the real day. With a real timestamp a mock never
+  out-freshes a later real capture.
+* ``stats["mock"] = True`` marks the timeline as synthetic so the CLI can
+  refuse to clobber a real timeline for that date without ``--force``.
 """
 
 from __future__ import annotations
 
-from .models import ActivityRecord, DayTimeline, Session
+from .models import ActivityRecord, DayTimeline, Session, iso_now
 
-__all__ = ["mock_timeline"]
+__all__ = ["mock_timeline", "MOCK_DEFAULT_DATE"]
+
+# A clearly-fake, far-past default date so `mock` (no --date) can never touch a
+# real day's stores by accident.
+MOCK_DEFAULT_DATE = "2000-01-01"
 
 
 def _t(date: str, hhmm: str) -> str:
@@ -208,6 +220,7 @@ def mock_timeline(date: str) -> DayTimeline:
             "meeting_records": len(meetings),
             "raw_records": sum(s.record_count for s in sessions),
         },
+        "mock": True,  # marks a synthetic timeline (CLI refuses to clobber real)
     }
 
     return DayTimeline(
@@ -217,5 +230,7 @@ def mock_timeline(date: str) -> DayTimeline:
         github=github,
         meetings=meetings,
         stats=stats,
-        generated_at=f"{date}T23:59:00",  # pinned for determinism
+        # Real wall-clock time (NOT pinned end-of-day) so a mock never wins the
+        # newest-wins timeline heal over a later real capture.
+        generated_at=iso_now(),
     )

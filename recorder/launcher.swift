@@ -21,6 +21,7 @@
 import Foundation
 import IOKit
 import AppKit
+import CoreGraphics
 
 let log = FileHandle.forLogging()
 
@@ -96,6 +97,11 @@ var childEpoch = 0
 // Condition inputs, updated by the observers below.
 var screenLocked = false
 var asleep = false
+// True from the moment we deliberately terminate a child (pause) until that
+// child's terminationHandler runs. While set, a resume must NOT spawn a fresh
+// child — the just-terminated one is still exiting and two screenpipe processes
+// would fight over the same port/db. The handler owns the successor spawn.
+var awaitingTerminate = false
 // Serializes the async /health meeting probe so overlapping idle ticks don't
 // stack up concurrent checks.
 var meetingCheckInFlight = false
@@ -148,11 +154,23 @@ func spawn(backoff: TimeInterval) {
                 log.line("recorder exited (status \(proc.terminationStatus)); stale epoch \(myEpoch), ignoring")
                 return
             }
+            // Was this a child we deliberately terminated (pause)? Capture before
+            // clearing so the deferred-resume path below can spawn the successor.
+            let wasDeliberate = awaitingTerminate
+            awaitingTerminate = false
             guard !quitting else { return }
             if paused {
                 // We stopped it on purpose (pause), or it happened to die while
                 // we already intend to be paused. Either way, do not respawn.
                 log.line("recorder stopped (status \(proc.terminationStatus)) — paused, no respawn")
+                return
+            }
+            if wasDeliberate {
+                // Paused then resumed before this child finished exiting. Now that
+                // it's gone, spawn the single successor — this deferral is what
+                // prevents two screenpipe processes racing the same port/db.
+                log.line("resume: previous recorder finished exiting, spawning successor")
+                spawn(backoff: 2)
                 return
             }
             // Unexpected exit while we want to be running → crash backoff.
@@ -184,6 +202,7 @@ func applyPause(_ reason: String) {
     // `paused == true` and does not respawn. Drop our reference immediately so
     // startChildIfNeeded()'s "already running" guard can't see a dead child.
     if let c = child, c.isRunning {
+        awaitingTerminate = true   // the handler owns the next spawn decision
         c.terminate()
     }
     child = nil
@@ -191,6 +210,13 @@ func applyPause(_ reason: String) {
 
 func startChildIfNeeded() {
     guard !quitting, !paused else { return }
+    if awaitingTerminate {
+        // A just-terminated child is still exiting; its terminationHandler will
+        // spawn the successor once it's gone. Spawning now would put two
+        // screenpipe processes on the same port/db at once.
+        log.line("resume deferred: previous recorder still exiting")
+        return
+    }
     if let c = child, c.isRunning { return }
     spawn(backoff: 2)
 }
@@ -216,6 +242,19 @@ func systemIdleSeconds() -> Double? {
     return num.doubleValue / 1_000_000_000.0   // ns → s
 }
 
+// Ground-truth screen-lock state straight from the window server, independent of
+// the screenIsLocked/screenIsUnlocked DistributedNotifications. Those can be
+// missed (a dropped unlock would strand `screenLocked = true` forever, silently
+// pausing capture for the rest of the day; a dropped lock would keep watching a
+// locked screen). The 30s poll reconciles against this. Returns nil if the
+// session dictionary can't be read; true/false otherwise.
+func screenIsLockedGroundTruth() -> Bool? {
+    guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else { return nil }
+    if let n = dict["CGSSessionScreenIsLocked"] as? Int { return n != 0 }
+    if let b = dict["CGSSessionScreenIsLocked"] as? Bool { return b }
+    return false   // key absent => not locked
+}
+
 // Meeting probe against the local screenpipe server. Field path verified
 // against a live `curl localhost:3030/health` (screenpipe 0.4.25):
 //   audio_pipeline.meeting_detected : Bool
@@ -231,17 +270,60 @@ func checkMeeting(_ completion: @escaping (Bool) -> Void) {
     }
     var req = URLRequest(url: url, timeoutInterval: 3)
     req.httpMethod = "GET"
-    let task = URLSession.shared.dataTask(with: req) { data, _, _ in
+    let task = URLSession.shared.dataTask(with: req) { data, _, err in
         var inMeeting = false
-        if let data = data,
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let audio = obj["audio_pipeline"] as? [String: Any],
-           let detected = audio["meeting_detected"] as? Bool {
-            inMeeting = detected
+        var note: String
+        if let err = err {
+            note = "unreachable (\(err.localizedDescription)) → assume no meeting"
+        } else if let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let audio = obj["audio_pipeline"] as? [String: Any],
+               let detected = audio["meeting_detected"] as? Bool {
+                inMeeting = detected
+                note = "meeting_detected=\(detected)"
+            } else {
+                note = "field audio_pipeline.meeting_detected missing/non-bool → assume no meeting"
+            }
+        } else {
+            note = "no/non-JSON /health body → assume no meeting"
         }
-        DispatchQueue.main.async { completion(inMeeting) }
+        DispatchQueue.main.async {
+            // Log the probe outcome on every idle pause decision so a silent
+            // degradation (field renamed, server flaky) is visible in the log
+            // rather than manifesting as mysterious pausing.
+            log.line("meeting probe: \(note)")
+            completion(inMeeting)
+        }
     }
     task.resume()
+}
+
+// One-shot startup check: is the meeting_detected field actually present in
+// /health? If not, meeting-aware pausing silently degrades to "always pause when
+// idle" (it can pause during a hands-off call). Log a clear warning so that's
+// observable at launch rather than a mystery later.
+func checkMeetingFieldAtStartup() {
+    guard let url = URL(string: "http://localhost:3030/health") else { return }
+    var req = URLRequest(url: url, timeoutInterval: 3)
+    req.httpMethod = "GET"
+    URLSession.shared.dataTask(with: req) { data, _, err in
+        DispatchQueue.main.async {
+            if let err = err {
+                log.line("startup meeting-field check: /health unreachable (\(err.localizedDescription)) — meeting-aware pausing will assume no meeting until screenpipe is up")
+                return
+            }
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                log.line("startup meeting-field check: /health returned no/non-JSON body — cannot confirm audio_pipeline.meeting_detected")
+                return
+            }
+            if let audio = obj["audio_pipeline"] as? [String: Any], audio["meeting_detected"] is Bool {
+                log.line("startup meeting-field check: audio_pipeline.meeting_detected present — meeting-aware idle pausing active")
+            } else {
+                log.line("startup meeting-field check: WARNING audio_pipeline.meeting_detected ABSENT/renamed in /health — idle pausing cannot detect live meetings and may pause during hands-off calls")
+            }
+        }
+    }.resume()
 }
 
 func fmtMin(_ secs: Double) -> String { String(format: "%.1fm", secs / 60.0) }
@@ -309,17 +391,26 @@ wsnc.addObserver(forName: NSWorkspace.didWakeNotification,
     reevaluate("wake")
 }
 
-// 30s idle poll. Catches both "user left" (→ pause) and "user returned"
-// (→ resume) since lock/sleep are the only event-driven inputs.
+// 30s poll. Two jobs: (1) reconcile the lock flag against window-server ground
+// truth so a missed lock/unlock notification can't strand us paused-forever or
+// watching-through-a-lock; (2) catch "user left" (→ pause) / "user returned"
+// (→ resume) for idle. Runs regardless of idlePauseEnabled — the lock
+// reconciliation must happen even when idle-based pausing is off (lock/sleep
+// pausing still applies), and reevaluate() is a no-op resume when nothing is
+// wrong.
 let idleTimer = DispatchSource.makeTimerSource(queue: .main)
 idleTimer.schedule(deadline: .now() + 30, repeating: 30)
 idleTimer.setEventHandler {
-    guard idlePauseEnabled else { return }
+    if let truth = screenIsLockedGroundTruth(), truth != screenLocked {
+        log.line("lock flag corrected \(screenLocked) → \(truth) via CGSession ground truth (missed notification)")
+        screenLocked = truth
+    }
     reevaluate("idle-poll")
 }
 idleTimer.resume()
 
-log.line("away-pause: idle threshold \(idlePauseEnabled ? "\(fmtMin(awayThresholdSecs))" : "disabled"), lock/sleep watch active")
+log.line("away-pause: idle threshold \(idlePauseEnabled ? "\(fmtMin(awayThresholdSecs))" : "disabled"), lock/sleep watch active, lock ground-truth poll active")
+checkMeetingFieldAtStartup()
 
 spawn(backoff: 2)
 RunLoop.main.run()

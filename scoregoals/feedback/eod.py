@@ -43,9 +43,18 @@ def generate(date: str, config: Config, backend_name: str) -> Report:
     fall back to a deterministic Report so the pipeline never crashes and the
     report always renders. The alignment score + drift flags are always the
     deterministic values from align.py (identical across backends, consistent
-    with the alignment table, empty day => 0); the LLM only contributes the
-    free-form narrative + suggestions.
+    with the alignment table); the LLM only contributes the free-form narrative
+    + suggestions.
+
+    The headline score comes from ``align.score_day`` — the SAME
+    corrections-aware, min-data-guarded number the menu bar shows — not the raw
+    keyword alignment. So a day the user has corrected (or a short day below
+    MIN_ACTIVE_MINUTES) reports the same score the app does, and an unscored day
+    renders "insufficient data" rather than a misleading keyword-only number.
     """
+    from .. import align as align_mod
+    from .. import labels as labels_mod
+    from .. import learn as learn_mod
     from ..compare import align
     from ..store import load_timeline, save_benchmark, save_report
 
@@ -57,6 +66,13 @@ def generate(date: str, config: Config, backend_name: str) -> Report:
 
     goals = align.load_goals(config)
     alignments = align.align(timeline, goals)
+
+    # Corrections-aware, min-data-guarded score (matches the menu bar headline).
+    labels_by_id = labels_mod.labels_by_session(config)
+    labels_by_fp = labels_mod.labels_by_fingerprint(config)
+    rules = learn_mod.active_rules(config)
+    day = align_mod.score_day(timeline, goals, labels_by_id, rules,
+                              labels_by_fp=labels_by_fp)
 
     backend = _make_backend(backend_name, config)
     try:
@@ -87,13 +103,17 @@ def generate(date: str, config: Config, backend_name: str) -> Report:
     if not report.alignments:
         report.alignments = alignments
 
-    # Override the model's self-reported score/drift with the deterministic
-    # ones so the number is reproducible and identical across backends. Keep
-    # whatever the LLM said in raw for transparency.
+    # Override the model's self-reported score/drift with the deterministic,
+    # corrections-aware ones so the number is reproducible, identical across
+    # backends, and consistent with the menu bar. Keep whatever the LLM said in
+    # raw for transparency. When the day is unscored (< MIN_ACTIVE_MINUTES),
+    # scored=False and overall_score is left at 0 — render_markdown then prints
+    # "insufficient data" instead of the number.
     report.raw = dict(report.raw or {})
     report.raw["llm_overall_score"] = report.overall_score
     report.raw["llm_drift_flags"] = list(report.drift_flags)
-    report.overall_score = align.overall_score(alignments)
+    report.scored = day["scored"]
+    report.overall_score = day["overall"] if day["scored"] else 0
     report.drift_flags = align.drift_flags(timeline, goals, alignments)
 
     save_report(config, report)
@@ -112,7 +132,13 @@ def render_markdown(report: Report) -> str:
     lines: list[str] = []
     lines.append(f"# scoregoals — End of day {report.date}")
     lines.append("")
-    lines.append(f"**Goal alignment score: {report.overall_score}/100**")
+    if report.scored:
+        lines.append(f"**Goal alignment score: {report.overall_score}/100**")
+    else:
+        lines.append(
+            "**Goal alignment score: insufficient data** "
+            "(under 30 active minutes captured — day left unscored)"
+        )
     lines.append("")
     lines.append(report.narrative.strip() if report.narrative else "_No narrative produced._")
     lines.append("")

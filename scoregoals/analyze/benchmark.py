@@ -59,21 +59,26 @@ def run(
     self-reported values are preserved in raw for transparency.
     Returns the Reports in backend order.
     """
-    from ..align import MIN_ACTIVE_MINUTES
+    from .. import align as align_mod
+    from .. import labels as labels_mod
+    from .. import learn as learn_mod
     from ..compare import align
 
-    det_score = align.overall_score(alignments)
     det_flags = align.drift_flags(timeline, goals, alignments)
 
-    # Min-data guard: below MIN_ACTIVE_MINUTES of captured active time the day is
-    # unscored. Report.scored records this; the compare.csv overall_score column
-    # then carries the documented sentinel -1 (see docs/STATUS_SCHEMA.md).
-    try:
-        active_minutes = float((timeline.stats or {}).get("total_active_minutes", 0) or 0)
-    except (TypeError, ValueError):
-        active_minutes = 0.0
-    day_scored = active_minutes >= MIN_ACTIVE_MINUTES
-    csv_score = det_score if day_scored else INSUFFICIENT_DATA_SCORE
+    # Score with the SAME corrections-aware, min-data-guarded path the menu bar
+    # and the EOD report use (align.score_day) — not the raw keyword alignment.
+    # score_day excludes not_work minutes from the active-minutes total and the
+    # goal math, so the compare.csv `overall_score` column can't disagree with
+    # the app. Below MIN_ACTIVE_MINUTES the day is unscored and the column
+    # carries the documented sentinel -1 (see docs/STATUS_SCHEMA.md).
+    labels_by_id = labels_mod.labels_by_session(config)
+    labels_by_fp = labels_mod.labels_by_fingerprint(config)
+    rules = learn_mod.active_rules(config)
+    day = align_mod.score_day(timeline, goals, labels_by_id, rules,
+                              labels_by_fp=labels_by_fp)
+    day_scored = day["scored"]
+    csv_score = day["overall"] if day_scored else INSUFFICIENT_DATA_SCORE
 
     reports: list[Report] = []
     for backend in backends:

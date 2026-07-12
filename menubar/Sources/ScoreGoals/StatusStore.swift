@@ -219,9 +219,11 @@ final class StatusStore: ObservableObject {
             self.busyActions.remove(key)
             switch result {
             case .success(let output):
-                if let delta = Self.parseScoreDelta(output) {
-                    self.reviewFlash[id] = delta
-                }
+                // Always show a flash (fall back to "updated" when the score
+                // delta can't be parsed) so the row is replaced by a non-tappable
+                // confirmation until the reload lands — never a brief re-tappable
+                // window with a stale verdict.
+                self.reviewFlash[id] = Self.parseScoreDelta(output) ?? "updated"
                 // Update the header score immediately; let the flash linger on the
                 // row a beat before reloading review (which drops the row).
                 self.refresh()
@@ -247,11 +249,24 @@ final class StatusStore: ObservableObject {
         guard !busyActions.contains(key) else { return }
         busyActions.insert(key)
         Task {
+            var ok = 0
+            var failed = 0
             for s in targets {
-                _ = await client.runAsync(["label", s.id, "--confirm"], timeout: 20)
+                let result = await client.runAsync(["label", s.id, "--confirm"], timeout: 20)
+                if case .success = result { ok += 1 } else { failed += 1 }
             }
             self.busyActions.remove(key)
-            self.actionMessage = ActionMessage(text: "confirmed \(targets.count) session\(targets.count == 1 ? "" : "s")", isError: false)
+            // Honest result: count successes/failures rather than always claiming
+            // success. Any failure flags the message as an error.
+            let msg: String
+            if failed == 0 {
+                msg = "confirmed \(ok) session\(ok == 1 ? "" : "s")"
+            } else if ok == 0 {
+                msg = "confirm all failed (\(failed) session\(failed == 1 ? "" : "s"))"
+            } else {
+                msg = "confirmed \(ok) of \(ok + failed) — \(failed) failed"
+            }
+            self.actionMessage = ActionMessage(text: msg, isError: failed > 0)
             self.refresh()
             self.loadReview()
         }

@@ -862,6 +862,10 @@ struct ReviewRow: View {
     @ObservedObject var store: StatusStore
 
     private var busy: Bool { store.busyActions.contains("label-\(session.id)") }
+    /// Any label write in flight for THIS row OR a batch "Confirm all" running —
+    /// all correction controls gate behind this one flag so a row can't be
+    /// tapped into an interleaved write mid-batch.
+    private var locked: Bool { busy || store.busyActions.contains("confirm-all") }
     private var flash: String? { store.reviewFlash[session.id] }
 
     var body: some View {
@@ -911,11 +915,11 @@ struct ReviewRow: View {
                     }
                     .menuStyle(.borderlessButton)
                     .font(.caption2)
-                    .disabled(busy || goals.isEmpty)
+                    .disabled(locked || goals.isEmpty)
 
                     Spacer(minLength: 4)
 
-                    if busy {
+                    if locked {
                         ProgressView().controlSize(.small)
                     } else {
                         Button("Off-track") {
@@ -957,6 +961,7 @@ struct ReviewRow: View {
         switch session.verdict {
         case "off_track": return "Off-track"
         case "not_work":  return "Not work"
+        case .some(let v) where !v.isEmpty: return "\(v) (archived)"
         default:          return "Pick goal"
         }
     }

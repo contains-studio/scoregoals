@@ -25,7 +25,7 @@ score is reported as ``None`` (honest uncertainty — unknown is not off-track).
 from __future__ import annotations
 
 from .compare import align as _kw
-from .labels import NOT_WORK, OFF_TRACK, session_id_for
+from .labels import NOT_WORK, OFF_TRACK, match_label_by_fingerprint, session_id_for
 from .models import DayTimeline, Goal, GoalAlignment, Session
 
 __all__ = [
@@ -73,6 +73,7 @@ def resolve_session(
     labels_by_id: dict[str, dict],
     rules: list[dict],
     date: str | None = None,
+    labels_by_fp: dict[tuple[str, int], list[dict]] | None = None,
 ) -> dict:
     """Resolve one session to a verdict with source + confidence + needs_review.
 
@@ -80,6 +81,10 @@ def resolve_session(
       session_id, verdict (goal_id|off_track|not_work|None),
       goal_id, goal_name (None unless verdict is an *active* goal id),
       source ("label"|"rule"|"keyword"|"none"), confidence, needs_review.
+
+    `labels_by_fp` (from labels.labels_by_fingerprint) enables a fingerprint
+    fallback when the session_id doesn't match a stored label — segmentation can
+    re-run and jitter a session's id, and a correction must not silently orphan.
     """
     goals_by_id = {g.id: g for g in goals}
     sid = session_id_for(session, date)
@@ -89,6 +94,9 @@ def resolve_session(
     confidence = CONF_NONE
 
     label = labels_by_id.get(sid)
+    if label is None and labels_by_fp:
+        # Id didn't match (re-segmentation jitter) — try the fingerprint fallback.
+        label = match_label_by_fingerprint(session, labels_by_fp)
     if label is not None:
         verdict = str(label.get("verdict"))
         source, confidence = "label", CONF_LABEL
@@ -138,9 +146,15 @@ def _apply_rules(session: Session, rules: list[dict]) -> str | None:
         verdict = pat.get("verdict")
         if not r_app or not verdict:
             continue
+        # An empty title_token is an app-only rule: it would match EVERY session
+        # of that app (e.g. 3 windowless Chrome not_work labels would delete all
+        # real Chrome time). learn.py no longer promotes these; ignore any that
+        # linger so a broad rule can never silently rewrite a whole app's time.
+        if not r_tok:
+            continue
         if r_app != app:
             continue
-        if r_tok and r_tok not in title_tokens:
+        if r_tok not in title_tokens:
             continue
         return str(verdict)
     return None
@@ -151,6 +165,7 @@ def resolve_day(
     goals: list[Goal],
     labels_by_id: dict[str, dict],
     rules: list[dict],
+    labels_by_fp: dict[tuple[str, int], list[dict]] | None = None,
 ) -> list[dict]:
     """Resolve every session in the day. Each dict also carries display fields
     (span/app/title/minutes/category). Ordering is uncertain-first: sessions
@@ -158,7 +173,8 @@ def resolve_day(
     top-down (see the plan's <60s review goal)."""
     out: list[dict] = []
     for s in timeline.sessions:
-        r = resolve_session(s, goals, labels_by_id, rules, date=timeline.date)
+        r = resolve_session(s, goals, labels_by_id, rules, date=timeline.date,
+                            labels_by_fp=labels_by_fp)
         r.update(
             {
                 "start": s.start,
@@ -189,6 +205,7 @@ def score_day(
     goals: list[Goal],
     labels_by_id: dict[str, dict],
     rules: list[dict],
+    labels_by_fp: dict[tuple[str, int], list[dict]] | None = None,
 ) -> dict:
     """Recompute the day using labels+rules+keywords.
 
@@ -203,7 +220,8 @@ def score_day(
     active = 0.0
 
     for s in timeline.sessions:
-        r = resolve_session(s, goals, labels_by_id, rules, date=timeline.date)
+        r = resolve_session(s, goals, labels_by_id, rules, date=timeline.date,
+                            labels_by_fp=labels_by_fp)
         verdict = r["verdict"]
         if verdict == NOT_WORK:
             continue  # out of scope: not active, not scored

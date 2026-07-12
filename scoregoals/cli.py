@@ -109,7 +109,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     md = eod.render_markdown(rpt)
     out = Path(cfg.reports_dir) / f"{args.date}-eod.md"
     out.write_text(md, encoding="utf-8")
-    print(f"eod report: {out} (score {rpt.overall_score}/100, backend {rpt.backend})")
+    score_str = f"{rpt.overall_score}/100" if rpt.scored else "insufficient data"
+    print(f"eod report: {out} (score {score_str}, backend {rpt.backend})")
     if cfg.icloud_mirror:
         mirror = Path(cfg.icloud_mirror).expanduser()
         try:
@@ -167,12 +168,26 @@ def cmd_weekly(args: argparse.Namespace) -> int:
 
 
 def cmd_mock(args: argparse.Namespace) -> int:
-    """mock [--date]: write the deterministic mock timeline (FULLY IMPLEMENTED)."""
-    cfg = _cfg(args)
-    from .mockdata import mock_timeline
-    from .store import save_timeline
+    """mock [--date] [--force]: write the deterministic mock timeline.
 
-    d = args.date or _today()
+    Refuses to overwrite a REAL (non-mock) timeline for the date unless --force,
+    and defaults to a clearly-fake far-past date so it can never clobber today's
+    real capture by accident.
+    """
+    cfg = _cfg(args)
+    from .mockdata import MOCK_DEFAULT_DATE, mock_timeline
+    from .store import load_timeline, save_timeline
+
+    d = args.date or MOCK_DEFAULT_DATE
+    if not getattr(args, "force", False):
+        existing = load_timeline(cfg, d)
+        if existing is not None and not (existing.stats or {}).get("mock"):
+            print(
+                f"scoregoals: refusing to overwrite the REAL timeline for {d} with mock data."
+                " Pass --force to override, or use --date with a throwaway date.",
+                file=sys.stderr,
+            )
+            return 2
     tl = mock_timeline(d)
     path = save_timeline(cfg, tl)
     stats = tl.stats or {}
@@ -189,7 +204,7 @@ def cmd_mock(args: argparse.Namespace) -> int:
 
 
 def _load_day_for_review(cfg: Config, date: str):
-    """(timeline|None, goals, labels_by_id, rules) for a date."""
+    """(timeline|None, goals, labels_by_id, rules, labels_by_fp) for a date."""
     from . import labels as labels_mod
     from . import learn as learn_mod
     from .compare import align as kw_align
@@ -198,8 +213,9 @@ def _load_day_for_review(cfg: Config, date: str):
     tl = load_timeline(cfg, date)
     goals = kw_align.load_goals(cfg)
     labels_by_id = labels_mod.labels_by_session(cfg)
+    labels_by_fp = labels_mod.labels_by_fingerprint(cfg)
     rules = learn_mod.active_rules(cfg)
-    return tl, goals, labels_by_id, rules
+    return tl, goals, labels_by_id, rules, labels_by_fp
 
 
 def _span(start: str | None, end: str | None) -> str:
@@ -216,7 +232,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     from . import align as align_mod
 
     d = getattr(args, "date", None) or _today()
-    tl, goals, labels_by_id, rules = _load_day_for_review(cfg, d)
+    tl, goals, labels_by_id, rules, labels_by_fp = _load_day_for_review(cfg, d)
     if tl is None:
         if getattr(args, "json", False):
             _print_json({"date": d, "score": {"overall": None, "scored": False,
@@ -225,8 +241,8 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(f"scoregoals: no timeline captured for {d}")
         return 0
 
-    rows = align_mod.resolve_day(tl, goals, labels_by_id, rules)
-    score = align_mod.score_day(tl, goals, labels_by_id, rules)
+    rows = align_mod.resolve_day(tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp)
+    score = align_mod.score_day(tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp)
     needs = sum(1 for r in rows if r["needs_review"])
 
     if getattr(args, "json", False):
@@ -313,11 +329,12 @@ def cmd_label(args: argparse.Namespace) -> int:
 
     goals = kw_align.load_goals(cfg)
     labels_by_id = labels_mod.labels_by_session(cfg)
+    labels_by_fp = labels_mod.labels_by_fingerprint(cfg)
     rules = learn_mod.active_rules(cfg)
+    goal_ids = {g.id for g in goals}
 
     # Determine the verdict to record.
     if args.goal is not None:
-        goal_ids = {g.id for g in goals}
         if args.goal not in goal_ids:
             print(f"scoregoals: unknown goal id {args.goal!r}; known: "
                   f"{', '.join(sorted(goal_ids)) or '(none)'}", file=sys.stderr)
@@ -328,19 +345,30 @@ def cmd_label(args: argparse.Namespace) -> int:
     elif args.not_work:
         verdict = NOT_WORK
     else:  # --confirm: accept the current resolved assignment
-        cur = align_mod.resolve_session(session, goals, labels_by_id, rules, date=d)
-        if cur["verdict"] is None:
+        cur = align_mod.resolve_session(session, goals, labels_by_id, rules, date=d,
+                                        labels_by_fp=labels_by_fp)
+        verdict = cur["verdict"]
+        if verdict is None:
             print("scoregoals: nothing to confirm — this session has no current "
                   "assignment; use --goal/--off-track/--not-work", file=sys.stderr)
             return 2
-        verdict = cur["verdict"]
+        # Don't re-record a verdict that names a goal which has since been
+        # archived/removed — it would resurrect a stale id. Make the user re-file.
+        if verdict not in (OFF_TRACK, NOT_WORK) and verdict not in goal_ids:
+            print(f"scoregoals: can't confirm — this session was assigned to goal "
+                  f"{verdict!r}, which is archived or removed. Re-file it with "
+                  "--goal/--off-track/--not-work.", file=sys.stderr)
+            return 2
 
-    before = align_mod.score_day(tl, goals, labels_by_id, rules)["overall"]
+    before = align_mod.score_day(tl, goals, labels_by_id, rules,
+                                 labels_by_fp=labels_by_fp)["overall"]
     labels_mod.record_label(
         cfg, sid, d, labels_mod.fingerprint_for_session(session), verdict, source="user"
     )
     labels_by_id = labels_mod.labels_by_session(cfg)  # reload with the new label
-    after = align_mod.score_day(tl, goals, labels_by_id, rules)["overall"]
+    labels_by_fp = labels_mod.labels_by_fingerprint(cfg)
+    after = align_mod.score_day(tl, goals, labels_by_id, rules,
+                                labels_by_fp=labels_by_fp)["overall"]
 
     verdict_label = next((g.name for g in goals if g.id == verdict), verdict)
     print(f"labeled {sid} → {verdict_label}   score {_fmt_score(before)} -> {_fmt_score(after)}")
@@ -946,7 +974,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_weekly)
 
     p = sub.add_parser("mock", help="write a deterministic mock timeline (test without screenpipe)")
-    p.add_argument("--date", metavar="YYYY-MM-DD", help="default: today")
+    p.add_argument("--date", metavar="YYYY-MM-DD", help="default: a fake far-past date (2000-01-01)")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite even a real (non-mock) timeline for the date")
     p.set_defaults(func=cmd_mock)
 
     p = sub.add_parser("status", help="live JSON snapshot for the menu bar app (never crashes)")
