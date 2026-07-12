@@ -27,9 +27,47 @@ _CONTENT_TYPES: dict[str, str] = {
 
 _PAGE_LIMIT = 1000
 
+# Cached result of `screenpipe auth token` for this process ("" = probed, none).
+_AUTO_TOKEN: str | None = None
+
 
 def _warn(msg: str) -> None:
     print(f"[screenpipe] {msg}", file=sys.stderr)
+
+
+def _resolve_token(config: Config) -> str | None:
+    """Bearer token for the screenpipe API (required since CLI ~v0.4).
+
+    Precedence: config.screenpipe_api_key (env/settings/toml, resolved by
+    config.py) > `screenpipe auth token` (auto, cached per process). Returns
+    None when neither is available — the API will then 401 and we warn.
+    """
+    key = getattr(config, "screenpipe_api_key", None)
+    if key:
+        return str(key)
+
+    global _AUTO_TOKEN
+    if _AUTO_TOKEN is not None:
+        return _AUTO_TOKEN or None
+
+    import shutil
+    import subprocess
+
+    _AUTO_TOKEN = ""
+    exe = shutil.which("screenpipe")
+    if exe:
+        try:
+            out = subprocess.run(
+                [exe, "auth", "token"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0:
+                token = out.stdout.strip().splitlines()[-1].strip() if out.stdout.strip() else ""
+                if token:
+                    _AUTO_TOKEN = token
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _AUTO_TOKEN or None
 
 
 def _pick(d: dict, *keys: str, default=None):
@@ -104,6 +142,11 @@ def _fetch_content_type(
             "offset": offset,
         }
         resp = session.get(f"{base_url}/search", params=params, timeout=15)
+        if resp.status_code == 401:
+            raise PermissionError(
+                "screenpipe API requires auth — set SCREENPIPE_API_KEY or run"
+                " `screenpipe auth token` (auto-detection failed)"
+            )
         resp.raise_for_status()
         payload = resp.json()
 
@@ -157,8 +200,12 @@ def fetch(start_iso: str, end_iso: str, config: Config) -> list[ActivityRecord]:
     base_url = config.screenpipe_url.rstrip("/")
     records: list[ActivityRecord] = []
 
+    token = _resolve_token(config)
+
     try:
         with requests.Session() as session:
+            if token:
+                session.headers["Authorization"] = f"Bearer {token}"
             for content_type in _CONTENT_TYPES:
                 try:
                     records.extend(
@@ -166,6 +213,10 @@ def fetch(start_iso: str, end_iso: str, config: Config) -> list[ActivityRecord]:
                             session, base_url, content_type, start_iso, end_iso
                         )
                     )
+                except PermissionError as exc:
+                    # Auth missing/rejected: applies to every content_type.
+                    _warn(str(exc))
+                    break
                 except requests.exceptions.ConnectionError:
                     # Server down: one concise line, stop probing the rest.
                     _warn(

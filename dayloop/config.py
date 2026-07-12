@@ -99,7 +99,7 @@ SETTINGS_KEYS: dict[str, str] = {
 # config.toml. They live only in data/settings.json (which is under data/ and
 # gitignored). Resolved-value precedence: env GEMINI_API_KEY > settings.json >
 # config.toml. Writing an empty value clears the stored secret.
-SECRET_KEYS: frozenset = frozenset({"gemini_api_key"})
+SECRET_KEYS: frozenset = frozenset({"gemini_api_key", "screenpipe_api_key"})
 
 
 def _as_bool(value: object) -> bool:
@@ -165,6 +165,9 @@ class Config:
     nudges_enabled: bool = True
     capture_paused: bool = False
     refresh_seconds: int = 30
+    # screenpipe API auth (the CLI requires Bearer auth for /search since ~v0.4):
+    # env SCREENPIPE_API_KEY > settings.json > config.toml > auto `screenpipe auth token`.
+    screenpipe_api_key: str | None = None
     settings_path: str = ""  # absolute path to data/settings.json
     raw: dict = field(default_factory=dict)  # the parsed config.toml, verbatim
 
@@ -242,6 +245,17 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
         or None
     )
 
+    # screenpipe API key: same secret handling as the Gemini key. When all three
+    # sources are empty, sources/screenpipe.py auto-resolves it at fetch time by
+    # shelling out to `screenpipe auth token` (cached per process).
+    sp_overlay_key = overlay.get("screenpipe_api_key")
+    screenpipe_api_key = (
+        os.environ.get("SCREENPIPE_API_KEY")
+        or (str(sp_overlay_key) if sp_overlay_key else None)
+        or raw.get("screenpipe_api_key")
+        or None
+    )
+
     return Config(
         root=str(base),
         data_dir=str(data_dir),
@@ -265,6 +279,7 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
         nudges_enabled=_as_bool(values["nudges_enabled"]),
         capture_paused=_as_bool(values["capture_paused"]),
         refresh_seconds=_as_int(values["refresh_seconds"], 30),
+        screenpipe_api_key=screenpipe_api_key,
         settings_path=str(data_dir / SETTINGS_FILENAME),
         raw=raw,
     )
