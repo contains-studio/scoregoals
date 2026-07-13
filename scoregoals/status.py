@@ -368,20 +368,18 @@ def build(config: Config, date: str) -> dict:
         _warn(warnings, f"learned rules not loaded ({exc})")
         rules = []
 
-    # local-LLM classification tier: self-heal the day's unresolved sessions
-    # (one batched call at most; a complete cache is a no-op) and load the
-    # verdict cache to fold into every score/attribution below. Never blocks.
+    # local-LLM classification tier: status is a hot polling path (the menu bar
+    # app polls every ~30s with a 5s timeout), so it must NEVER call the model —
+    # it only READS the verdict cache. Fresh classification runs in the
+    # background capture job (cmd_capture) and repopulates the cache for the
+    # next poll. A missing cache just means those sessions read as unmatched
+    # until the next capture; the number is honest and the call stays instant.
     try:
         from . import classify as classify_mod
-        from . import intentions as intentions_mod
 
-        intents = intentions_mod.load(config, date)["items"]
-        llm_verdicts = classify_mod.verdicts_for(
-            config, timeline, goals, labels_by_id, rules,
-            labels_by_fp=labels_by_fp, intentions=intents,
-        )
+        llm_verdicts = classify_mod.load_verdicts(config)
     except Exception as exc:
-        _warn(warnings, f"llm classification skipped ({exc})")
+        _warn(warnings, f"llm verdict cache skipped ({exc})")
         llm_verdicts = {}
 
     from . import align as align_mod

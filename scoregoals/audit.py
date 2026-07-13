@@ -121,14 +121,10 @@ def build_day(cfg: Config, date: str) -> dict:
     rules = learn_mod.active_rules(cfg)
     intents = intentions_mod.load(cfg, date)["items"]
 
-    # Self-heal the llm tier (at most one batched call; a complete cache no-ops),
-    # then load the full cache for the chain view.
-    try:
-        llm = classify_mod.verdicts_for(cfg, tl, goals, lbi, rules,
-                                        labels_by_fp=lbf, intentions=intents)
-    except Exception as exc:  # never let the model block the evidence room
-        warnings.append(f"llm classification skipped ({exc})")
-        llm = classify_mod.load_verdicts(cfg)
+    # Read the cached llm verdicts for the chain view. The audit server is
+    # always-on and must load instantly, so it never calls the model — fresh
+    # classification is a background `capture`-time concern.
+    llm = classify_mod.load_verdicts(cfg)
 
     day = A.score_day(tl, goals, lbi, rules, labels_by_fp=lbf, llm_verdicts=llm)
 

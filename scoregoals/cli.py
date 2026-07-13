@@ -280,16 +280,13 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(f"scoregoals: no timeline captured for {d}")
         return 0
 
-    # Self-heal: classify any unresolved sessions the deterministic tiers left
-    # (one batched local-LLM call; cached sessions are never re-asked), then
-    # resolve/score with the llm tier folded in.
+    # Read-only path: fold in the cached llm verdicts but NEVER call the model
+    # here (review is polled by the menu bar app on a 5s timeout). Fresh
+    # classification runs in the background `capture` job and repopulates the
+    # cache for the next read.
     from . import classify as classify_mod
-    from . import intentions as intentions_mod
 
-    intents = intentions_mod.load(cfg, d)["items"]
-    llm_verdicts = classify_mod.verdicts_for(
-        cfg, tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp, intentions=intents
-    )
+    llm_verdicts = classify_mod.load_verdicts(cfg)
 
     rows = align_mod.resolve_day(tl, goals, labels_by_id, rules,
                                  labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
