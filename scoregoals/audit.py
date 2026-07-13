@@ -361,6 +361,179 @@ _FF_LOCK = threading.Lock()
 _ff_active = 0
 _ff_peak = 0
 
+# --- perceptual "moment" collapsing -----------------------------------------
+#
+# screenpipe captures a frame every ~30s even when the screen is static, so a
+# day is mostly near-identical repeats (the overnight permission dialog alone is
+# ~800 frames). The old exact-dedup (same chunk+offset) can't collapse them
+# because the menu-bar clock changes every minute — the frames aren't byte- or
+# OCR-identical. So we group frames into MOMENTS with a perceptual difference
+# hash (dHash), no new deps:
+#   * emit a tiny 9x8 grayscale for a frame with ONE ffmpeg run (72 raw bytes),
+#   * compute a 64-bit dHash in pure Python (each pixel vs its right neighbour),
+#   * start a new moment when the app changes OR the dHash Hamming distance from
+#     the current moment's representative exceeds a threshold.
+# The 9x8 downscale washes out the menu-bar clock (consecutive idle frames hash
+# to distance 0) while genuine screen changes (scroll, new panel, app switch)
+# land 20+ bits apart — so idle collapses to ~1 moment yet an active work
+# session stays MANY distinct moments. Hashes cache to data/frame_hashes.json
+# (gitignored, additive, corruption-tolerant), keyed by screenpipe frame_id;
+# frames are immutable so a hash is computed at most once, ever.
+#
+# THROUGHPUT: a full day would be thousands of ffmpeg runs if hashed naively.
+# Two things keep it cheap: (1) screenpipe already stores a per-frame
+# ``content_hash`` — consecutive frames with an IDENTICAL content_hash (and app)
+# are certainly the same image, so they extend the moment with ZERO ffmpeg (the
+# 800-frame idle block costs ONE hash); (2) dHash runs only on frames whose
+# content actually changed, is capped by the shared ffmpeg semaphore(3), and is
+# BUDGETED per request (at most _MOMENT_HASH_BUDGET new hashes) so mode=changes
+# returns as-far-as-hashed with ``partial:true`` + ``next_offset`` and the deck
+# pages the rest. The cache makes the second load instant.
+_MOMENT_DHASH_THRESHOLD = 8     # Hamming-distance split point (tuned empirically)
+_MOMENT_HASH_BUDGET = 120       # max NEW dHash ffmpeg runs per mode=changes request
+_HASH_LOCK = threading.Lock()
+_HASHES: dict[int, int] | None = None   # frame_id -> 64-bit dHash (lazy-loaded)
+
+
+def _hash_store_path(cfg: Config) -> Path:
+    return Path(cfg.data_dir) / "frame_hashes.json"
+
+
+def _load_hashes(cfg: Config) -> dict[int, int]:
+    """The frame_id -> dHash cache, loaded once into memory. Corruption-tolerant:
+    a missing/half-written file degrades to an empty cache (hashes just get
+    recomputed) rather than raising."""
+    global _HASHES
+    with _HASH_LOCK:
+        if _HASHES is None:
+            _HASHES = {}
+            p = _hash_store_path(cfg)
+            if p.exists():
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    for k, v in raw.items():
+                        try:
+                            _HASHES[int(k)] = int(v)
+                        except (TypeError, ValueError):
+                            continue
+                except Exception:
+                    pass
+        return _HASHES
+
+
+def _save_hashes(cfg: Config) -> None:
+    """Persist the in-memory hash cache atomically (temp file + os.replace)."""
+    p = _hash_store_path(cfg)
+    with _HASH_LOCK:
+        data = {str(k): int(v) for k, v in (_HASHES or {}).items()}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def _ham(a: int, b: int) -> int:
+    """Hamming distance between two 64-bit dHashes (popcount of the XOR)."""
+    return bin(a ^ b).count("1")
+
+
+def _dhash_from_gray(data: bytes) -> int | None:
+    """A 64-bit dHash from a 9x8 grayscale bitmap (72 raw bytes, row-major):
+    each of the 8 rows contributes 8 bits, one per (pixel > right-neighbour)."""
+    if len(data) < 72:
+        return None
+    bits = 0
+    for row in range(8):
+        base = row * 9
+        for col in range(8):
+            bits = (bits << 1) | (1 if data[base + col] > data[base + col + 1] else 0)
+    return bits
+
+
+def _compute_dhash(cfg: Config, fid: int, offset, snapshot_path, chunk_path) -> int | None:
+    """Emit a 9x8 grayscale for one frame with a single ffmpeg run and reduce it
+    to a 64-bit dHash. Reuses the ffmpeg semaphore + concurrency instrumentation
+    so hashing shares the same 3-process cap as thumbnail extraction. Single-
+    flight per frame_id so two moment walks can't hash the same frame twice."""
+    lock = _inflight_lock(f"dhash-{fid}")
+    with lock:
+        cached = _load_hashes(cfg).get(fid)
+        if cached is not None:
+            return cached
+        if snapshot_path and os.path.exists(snapshot_path):
+            src, vf = snapshot_path, "scale=9:8,format=gray"
+        elif chunk_path and os.path.exists(chunk_path):
+            src = chunk_path
+            vf = f"select=eq(n\\,{int(offset or 0)}),scale=9:8,format=gray"
+        else:
+            return None
+        cmd = [_FFMPEG, "-nostdin", "-v", "error", "-i", src, "-vf", vf,
+               "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+        with _EXTRACT_SEM:
+            active = _ff_enter()
+            sys.stderr.write(f"[audit] ffmpeg dhash frame={fid} concurrency={active}/{_FFMPEG_LIMIT}\n")
+            try:
+                out = subprocess.run(cmd, timeout=10, check=True,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+            except Exception:
+                return None
+            finally:
+                _ff_leave()
+        h = _dhash_from_gray(out[:72])
+        if h is not None:
+            with _HASH_LOCK:
+                if _HASHES is not None:
+                    _HASHES[fid] = h
+        return h
+
+
+# Frame columns the moment walk needs: identity, backing image, the app + the
+# free exact-dup signal (content_hash) so an idle run costs one ffmpeg.
+_MOMENT_SELECT = (
+    "SELECT f.id, f.timestamp, f.app_name, f.content_hash, f.snapshot_path, "
+    "vc.file_path, f.offset_index, f.video_chunk_id "
+    "FROM frames f LEFT JOIN video_chunks vc ON vc.id = f.video_chunk_id "
+    "WHERE f.timestamp >= ? AND f.timestamp <= ? "
+    "  AND (f.video_chunk_id IS NOT NULL OR f.snapshot_path IS NOT NULL) "
+    "ORDER BY f.timestamp"
+)
+
+
+def _moment_rows(conn, lo: str, hi: str) -> list[dict]:
+    """Every resolvable frame in [lo, hi] (UTC) as rich rows for the moment walk,
+    with the SAME consecutive backing-image dedup as ``_query_frames`` (so a
+    moment's raw ``count`` matches the raw deck) plus the app + content_hash the
+    grouping needs."""
+    rows = conn.execute(_MOMENT_SELECT, (lo, hi + "~")).fetchall()
+    out: list[dict] = []
+    last_key = None
+    for fid, ts, app, chash, snap, chunk_path, off, vcid in rows:
+        path = snap if snap else chunk_path
+        if not (path and os.path.exists(path)):
+            continue
+        key = snap if snap else (vcid, off)
+        if key == last_key:
+            continue
+        last_key = key
+        out.append({
+            "frame_id": int(fid), "utc": str(ts), "app": app,
+            "content_hash": chash, "snap": snap, "chunk": chunk_path, "off": off,
+        })
+    return out
+
+
+def _moment_minutes(a_utc: str, b_utc: str) -> float:
+    """Held duration (minutes) between two screenpipe UTC timestamps."""
+    try:
+        da = datetime.fromisoformat(a_utc)
+        db = datetime.fromisoformat(b_utc)
+        return round(abs((db - da).total_seconds()) / 60.0, 1)
+    except Exception:
+        return 0.0
+
 
 def _inflight_lock(key: str) -> threading.Lock:
     """The per-frame single-flight lock (created on first use)."""
@@ -688,6 +861,161 @@ def build_day_frames(cfg: Config, date: str,
     }
 
 
+def build_moments(cfg: Config, date: str, session_id: str = "",
+                  budget: int = _MOMENT_HASH_BUDGET,
+                  threshold: int = _MOMENT_DHASH_THRESHOLD) -> dict:
+    """Collapse a day's (or one session's) frames into MOMENTS — runs of visually
+    unchanged frames folded into a single representative — so the deck walks
+    CHANGES, not idle repeats.
+
+    Walks frames chronologically (session by session for the whole day; each
+    session is single-app, so a session boundary is an app boundary). A new
+    moment starts when the app changes OR the dHash Hamming distance from the
+    current moment's representative exceeds ``threshold``. Consecutive frames
+    with an identical screenpipe ``content_hash`` extend the moment for free (no
+    ffmpeg) — this is what makes the ~800-frame idle block cost a single hash.
+
+    Progressive by design: at most ``budget`` NEW dHash runs per call. It always
+    re-walks from the start (cheap: cached hashes + popcount) so the returned
+    moment list is a growing prefix; when frames remain unhashed it returns
+    ``partial:true`` + ``next_offset`` (raw frames decided so far) and the caller
+    pages again. A moment is
+    ``{frame_id (representative=first), start_ts, end_ts, start_utc, end_utc,
+       count (raw frames held), app, session_id, held_minutes, verdict, span}``.
+    """
+    day = build_day(cfg, date)
+    sessions = day.get("sessions", [])
+    if session_id:
+        sessions = [s for s in sessions
+                    if str(s.get("id") or "") == session_id
+                    or str(s.get("id") or "").startswith(session_id)]
+    counts = _frame_counts(cfg, date)
+
+    # 1) cheap sqlite pass: the ordered raw frames (+ app/content_hash) per session
+    ordered: list[dict] = []
+    sessions_meta: dict[str, dict] = {}
+    conn = _sp_connect()
+    if conn is not None:
+        try:
+            for s in sessions:
+                sid = str(s.get("id") or "")
+                lo = _local_to_utc(s.get("start"))
+                hi = _local_to_utc(s.get("end") or s.get("start"))
+                if not (lo and hi):
+                    continue
+                try:
+                    rows = _moment_rows(conn, lo, hi)
+                except Exception:
+                    rows = []
+                if not rows:
+                    continue
+                final = s.get("final") or {}
+                sessions_meta[sid] = {
+                    "app": s.get("app"),
+                    "verdict": final.get("verdict_name") or final.get("verdict") or "—",
+                    "span": s.get("span"),
+                }
+                for r in rows:
+                    r["session_id"] = sid
+                    ordered.append(r)
+        finally:
+            conn.close()
+
+    total_raw = len(ordered)
+
+    # 2) the moment walk — dHash grouping with the content_hash fast path
+    hashes = _load_hashes(cfg)
+    moments: list[dict] = []
+    cur: dict | None = None
+    computed = 0
+    decided = 0            # raw frames we have a grouping decision for
+    dirty = False
+    budget_hit = False
+
+    def _extend(m: dict, r: dict) -> None:
+        m["count"] += 1
+        m["end_utc"] = r["utc"]
+        m["_last_chash"] = r["content_hash"]
+
+    for r in ordered:
+        sid = r["session_id"]
+        app = r["app"]
+        # FREE fast path: identical content_hash + same app => same image, no ffmpeg
+        if (cur is not None and cur["session_id"] == sid and app == cur["app"]
+                and r["content_hash"] is not None
+                and r["content_hash"] == cur["_last_chash"]):
+            _extend(cur, r)
+            decided += 1
+            continue
+        # else we need a perceptual decision -> dHash (cached or computed, budgeted)
+        h = hashes.get(r["frame_id"])
+        if h is None:
+            if computed >= budget:
+                budget_hit = True
+                break
+            h = _compute_dhash(cfg, r["frame_id"], r["off"], r["snap"], r["chunk"])
+            computed += 1
+            dirty = True
+        new_moment = (
+            cur is None or cur["session_id"] != sid or app != cur["app"]
+            or h is None or cur["_rep_hash"] is None
+            or _ham(h, cur["_rep_hash"]) > threshold
+        )
+        if new_moment:
+            meta = sessions_meta.get(sid, {})
+            cur = {
+                "frame_id": r["frame_id"],
+                "session_id": sid,
+                "app": app,
+                "start_utc": r["utc"],
+                "end_utc": r["utc"],
+                "count": 1,
+                "comments": counts.get(r["frame_id"], 0),
+                "verdict": meta.get("verdict") or "—",
+                "span": meta.get("span") or "",
+                "_rep_hash": h,
+                "_last_chash": r["content_hash"],
+            }
+            moments.append(cur)
+        else:
+            _extend(cur, r)
+            cur["_last_chash"] = r["content_hash"]
+        decided += 1
+
+    if dirty:
+        _save_hashes(cfg)
+
+    out_moments = []
+    for m in moments:
+        out_moments.append({
+            "frame_id": m["frame_id"],
+            "session_id": m["session_id"],
+            "app": m["app"],
+            "verdict": m["verdict"],
+            "span": m["span"],
+            "count": m["count"],
+            "comments": m["comments"],
+            "start_ts": _utc_to_local_hms(m["start_utc"]),
+            "end_ts": _utc_to_local_hms(m["end_utc"]),
+            "held_minutes": _moment_minutes(m["start_utc"], m["end_utc"]),
+        })
+
+    partial = budget_hit and decided < total_raw
+    return {
+        "mode": "changes",
+        "date": date,
+        "session": session_id or None,
+        "moments": out_moments,
+        "total_moments": len(out_moments),
+        "total_raw": total_raw,
+        "decided": decided,
+        "partial": partial,
+        "next_offset": decided,
+        "sessions": sessions_meta,
+        "threshold": threshold,
+    }
+
+
 def extract_frame(cfg: Config, frame_id: str, full: bool = False) -> tuple[int, str, bytes]:
     """Extract ONE frame as JPEG from screenpipe's local store; cache the result.
 
@@ -891,7 +1219,18 @@ def _make_handler(cfg: Config):
                         limit = _PAGE_LIMIT
                     limit = max(1, min(limit, 200))
                     day_mode = (qs.get("day") or [""])[0] in ("1", "true", "yes")
-                    if day_mode:
+                    mode = (qs.get("mode") or [""])[0]
+                    if mode == "changes":
+                        # moment-collapsed view (deck default). ``session`` scopes
+                        # to one session; otherwise the whole day. ``budget`` caps
+                        # new dHash runs so a first index doesn't block on the day.
+                        try:
+                            budget = int((qs.get("budget") or [str(_MOMENT_HASH_BUDGET)])[0])
+                        except ValueError:
+                            budget = _MOMENT_HASH_BUDGET
+                        budget = max(1, min(budget, 2000))
+                        self._json(build_moments(cfg, d, sess, budget=budget))
+                    elif day_mode:
                         self._json(build_day_frames(cfg, d, offset, limit))
                     else:
                         self._json(build_frames(cfg, d, sess, offset, limit))
@@ -1209,6 +1548,13 @@ PAGE_HTML = r"""<!doctype html>
     color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:34vh;overflow-y:auto}
   .decknav{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .decknav .grow{flex:1}
+  /* moment "held span · N frames · expand" line + skip-idle chip */
+  .deckhead .held{color:var(--muted);font-size:12.5px;display:flex;align-items:center;flex-wrap:wrap;gap:4px}
+  .deckhead .held b{color:var(--ink)}
+  .idlechip{background:rgba(240,176,84,.10);border:1px solid rgba(240,176,84,.45);
+    border-radius:999px;padding:2px 10px;font-size:12px;color:var(--amber);
+    display:flex;align-items:center;gap:6px;white-space:nowrap}
+  .idlechip button{padding:2px 7px;font-size:11px}
   footer{color:var(--muted);font-size:11.5px;text-align:center;padding:26px 20px 34px;
     max-width:1180px;margin:0 auto;border-top:1px solid var(--line)}
   footer .warn{color:var(--amber)}
@@ -1747,8 +2093,55 @@ function updateModeButtons(){
   });
 }
 function resetDeck(){
-  DECK={frames:[],total:null,sessions:{},order:[],idx:0,offset:0,
-        loading:false,done:false,filter:null,seq:0};
+  DECK={mode:"changes",            // "changes" (moments, default) | "all" (raw frames)
+        // moment view (mode=changes)
+        moments:[],momIdx:0,momTotal:null,rawTotal:null,momPartial:false,
+        momLoading:false,momDone:false,skippedIdle:false,idleFrames:0,
+        // raw view (mode=all) — the original per-frame walk
+        frames:[],total:null,order:[],idx:0,offset:0,loading:false,done:false,
+        // shared
+        sessions:{},filter:null,seq:0,dom:null};
+}
+// ---- moment loading (mode=changes) : server re-walks from 0 and returns a
+// GROWING prefix of moments (cached dHashes let each call reach further), so we
+// just replace our list and repeat until partial=false. ------------------------
+async function deckLoadMoments(){
+  if(DECK.momLoading||DECK.momDone)return false;
+  DECK.momLoading=true;
+  const url="/api/frames?mode=changes&date="+DATE+
+    (DECK.filter?"&session="+encodeURIComponent(DECK.filter):"");
+  let j;
+  try{j=await fetch(url).then(r=>r.json());}catch(e){DECK.momLoading=false;return false;}
+  DECK.moments=j.moments||[];
+  if(j.sessions)Object.assign(DECK.sessions,j.sessions);
+  DECK.momTotal=(j.total_moments!=null)?j.total_moments:DECK.moments.length;
+  DECK.rawTotal=(j.total_raw!=null)?j.total_raw:DECK.rawTotal;
+  DECK.momPartial=!!j.partial;
+  if(!j.partial)DECK.momDone=true;
+  DECK.momLoading=false;return true;
+}
+function momSessionOrder(){
+  const o=[];DECK.moments.forEach(m=>{if(o.indexOf(m.session_id)<0)o.push(m.session_id);});return o;
+}
+function isIdleMoment(m){
+  const v=(m.verdict||"").toLowerCase();
+  return v==="not_work"||v==="not work"||v==="—"||v==="";
+}
+// skip-idle default: on first paint, start at the first real-change moment and
+// remember how many idle frames we jumped, for the "N idle frames at start" chip.
+function applyIdleSkip(){
+  if(DECK.skippedIdle||DECK.momIdx>0)return;
+  DECK.skippedIdle=true;
+  let first=0,frames=0;
+  while(first<DECK.moments.length&&isIdleMoment(DECK.moments[first])){
+    frames+=DECK.moments[first].count||1;first++;
+  }
+  if(first>0&&first<DECK.moments.length){DECK.momIdx=first;DECK.idleFrames=frames;}
+}
+async function momEnsure(idx){
+  let guard=0;
+  while(idx>=DECK.moments.length&&!DECK.momDone&&guard<400){await deckLoadMoments();guard++;}
+  return idx<DECK.moments.length;
 }
 async function deckLoadPage(){
   if(DECK.loading||DECK.done)return false;
@@ -1781,16 +2174,26 @@ function renderDeck(m){
     {app:s.app,verdict:(s.final&&(s.final.verdict_name||s.final.verdict))||"—",span:s.span};});
   const deck=el("div","deck");
   const head=el("div","deckhead");
-  const prog=el("div","prog","frame … / …");head.appendChild(prog);
+  const prog=el("div","prog","… / …");head.appendChild(prog);
   const ctx=el("div","ctx");head.appendChild(ctx);
   const doneTag=el("div","done","commented ✓");doneTag.style.display="none";head.appendChild(doneTag);
   const spacer=el("div");spacer.style.flex="1";head.appendChild(spacer);
+  // "changes only ⇄ all frames" toggle — flips the deck between moments + raw
+  const modeBtn=el("button","mini","🎞 changes only");
+  modeBtn.title="collapse idle repeats into moments (changes) ⇄ every raw frame";
+  modeBtn.onclick=()=>toggleDeckMode();
+  head.appendChild(modeBtn);
   const filt=el("select");filt.appendChild(el("option",null,"all sessions"));
   (DAY.sessions||[]).forEach(s=>{const o=el("option",null,(s.app||"?")+" · "+(s.span||""));o.value=s.id;filt.appendChild(o);});
   filt.value=DECK.filter||"";
   filt.onchange=()=>setDeckFilter(filt.value||null);
   head.appendChild(filt);
   deck.appendChild(head);
+  // moment "held HH:MM–HH:MM · N frames · expand" line + the skip-idle chip
+  const heldrow=el("div","deckhead");heldrow.style.marginTop="-4px";
+  const held=el("div","held");heldrow.appendChild(held);
+  const chip=el("div","idlechip");chip.style.display="none";heldrow.appendChild(chip);
+  heldrow.style.display="none";deck.appendChild(heldrow);
   const divider=el("div","deckdivider");divider.style.display="none";deck.appendChild(divider);
   const stage=el("div","deckstage");
   const imgwrap=el("div","deckimgwrap");
@@ -1798,28 +2201,152 @@ function renderDeck(m){
   img.onerror=()=>{imgwrap.innerHTML="";imgwrap.appendChild(el("div","ferr","frame image unavailable (rolled out of retention)"));};
   imgwrap.appendChild(img);stage.appendChild(imgwrap);
   const side=el("div","deckside");
-  const cbox=el("div","deckcbox");cbox.appendChild(el("h4","","comment this frame — Enter saves & advances"));
+  const cbox=el("div","deckcbox");const cboxh=el("h4","","comment this moment — Enter saves & advances");cbox.appendChild(cboxh);
   const existing=el("div","deckexisting");cbox.appendChild(existing);
   const ta=el("textarea","ct");ta.placeholder="type a note, Enter to save + next · Shift+Enter for newline";
   cbox.appendChild(ta);
   const crow=el("div","deckcrow");const saved=el("span","csaved");
-  crow.appendChild(el("span","deckhint","Enter save+next · → skip · ← back · Shift+Enter newline"));
+  crow.appendChild(el("span","deckhint","Enter save+next · → next · ← back · Shift+Enter newline"));
   crow.appendChild(saved);cbox.appendChild(crow);side.appendChild(cbox);
   const nav=el("div","decknav");
   const back=el("button","mini","← back");back.onclick=()=>deckAdvance(-1);
-  const skip=el("button","mini","skip →");skip.onclick=()=>deckAdvance(1);
+  const skip=el("button","mini","next →");skip.onclick=()=>deckAdvance(1);
   nav.appendChild(back);nav.appendChild(skip);side.appendChild(nav);
   const ocr=el("details","deckocr");ocr.appendChild(el("summary",null,"OCR text on this frame"));
   const ocrText=el("div","ocrtext","…");ocr.appendChild(ocrText);side.appendChild(ocr);
   stage.appendChild(side);deck.appendChild(stage);m.appendChild(deck);
-  DECK.dom={prog,ctx,doneTag,divider,img,imgwrap,existing,ta,saved,ocrText,filt};
+  DECK.dom={prog,ctx,doneTag,divider,img,imgwrap,existing,ta,saved,ocrText,filt,
+            modeBtn,heldrow,held,chip,cboxh};
   ta.addEventListener("keydown",(e)=>{
     if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();deckSave();}
   });
-  deckEnsureLoaded(DECK.idx).then(()=>deckShow());
+  if(DECK.mode==="changes"){
+    modeBtn.textContent="🎞 changes only";
+    deckLoadMoments().then(()=>{applyIdleSkip();momShow();});
+  }else{
+    modeBtn.textContent="🖼 all frames";
+    deckEnsureLoaded(DECK.idx).then(()=>deckShow());
+  }
+}
+// ---- moment deck: representative image + held span + comment-and-advance ------
+function momShow(){
+  const dom=DECK.dom;if(!dom)return;
+  dom.heldrow.style.display="";
+  const m=DECK.moments[DECK.momIdx];
+  if(!m){
+    dom.prog.textContent=DECK.momPartial?"indexing frames… (dHash)":"no moments for this day";
+    dom.ctx.textContent="";dom.held.textContent="";dom.chip.style.display="none";
+    if(DECK.momPartial&&!DECK.momDone)deckLoadMoments().then(()=>momShow());
+    return;
+  }
+  const myseq=(++DECK.seq);
+  if(!dom.imgwrap.contains(dom.img)){dom.imgwrap.innerHTML="";dom.imgwrap.appendChild(dom.img);}
+  dom.img.classList.add("loading");
+  dom.img.onload=()=>dom.img.classList.remove("loading");
+  dom.img.src="/frame/"+m.frame_id+".jpg?full=1";
+  const order=momSessionOrder();
+  const sidx=order.indexOf(m.session_id);
+  const mtot=(DECK.momTotal!=null?DECK.momTotal:DECK.moments.length);
+  dom.prog.textContent="moment "+(DECK.momIdx+1)+" / "+mtot+(DECK.momPartial?"+":"")+
+    " · session "+(sidx+1)+"/"+(order.length||1);
+  dom.ctx.innerHTML="";
+  dom.ctx.appendChild(el("b",null,(m.app||"?")+"  "));
+  dom.ctx.appendChild(el("span",null,(m.span||"")+"  "));
+  dom.ctx.appendChild(el("span","v",m.verdict||"—"));
+  // held line + expand affordance
+  dom.held.innerHTML="";
+  const single=(m.count||1)<=1;
+  dom.held.appendChild(el("span",null,single
+    ? ("single frame · "+(m.start_ts||""))
+    : ("held "+(m.start_ts||"")+"–"+(m.end_ts||"")+" · "+m.count+" frames · "+m.held_minutes+"m")));
+  if(!single){
+    const exp=el("button","mini");exp.style.marginLeft="8px";exp.textContent="⤢ expand "+m.count+" frames";
+    exp.title="step into every raw frame of this moment";
+    exp.onclick=()=>expandMoment(m);
+    dom.held.appendChild(exp);
+  }
+  // skip-idle chip (only on the auto-skipped first landing)
+  if(DECK.idleFrames>0&&DECK.momIdx>0){
+    dom.chip.style.display="";dom.chip.innerHTML="";
+    dom.chip.appendChild(document.createTextNode("skipped "+DECK.idleFrames+" idle frames at start "));
+    const jb=el("button","mini","↖ jump back");jb.onclick=()=>{DECK.momIdx=0;momShow();};
+    dom.chip.appendChild(jb);
+  }else{dom.chip.style.display="none";}
+  // session divider when the moment starts a new session
+  const prev=DECK.momIdx>0?DECK.moments[DECK.momIdx-1]:null;
+  if(!prev||prev.session_id!==m.session_id){
+    dom.divider.style.display="";dom.divider.innerHTML="";
+    dom.divider.appendChild(document.createTextNode("— "+(m.start_ts||"")+"  "));
+    dom.divider.appendChild(el("b",null,m.app||"?"));
+    dom.divider.appendChild(document.createTextNode(" · "+(m.verdict||"—")+" —"));
+  }else{dom.divider.style.display="none";}
+  dom.cboxh.textContent=single?"comment this frame — Enter saves & advances"
+                               :"comment this moment — Enter saves & advances";
+  const notes=fbForFrame(m.frame_id);
+  dom.existing.innerHTML="";notes.forEach(n=>dom.existing.appendChild(renderNote(n)));
+  dom.doneTag.style.display=((m.comments||0)>0||notes.length)?"":"none";
+  dom.saved.textContent="";dom.ta.value="";dom.ta.focus();
+  dom.ocrText.textContent="loading…";
+  fetch("/api/frame?date="+DATE+"&id="+m.frame_id).then(r=>r.json()).then(j=>{
+    if(myseq!==DECK.seq)return;
+    dom.ocrText.textContent=(j&&j.ocr_snippet&&j.ocr_snippet.trim())?j.ocr_snippet:"(no OCR text captured for this frame)";
+  }).catch(()=>{if(myseq===DECK.seq)dom.ocrText.textContent="(OCR unavailable)";});
+  momPreload();
+}
+function momPreload(){
+  for(let k=1;k<=3;k++){const nm=DECK.moments[DECK.momIdx+k];if(nm){const im=new Image();im.src="/frame/"+nm.frame_id+".jpg?full=1";}}
+  if(DECK.momIdx+4>=DECK.moments.length&&DECK.momPartial&&!DECK.momDone)deckLoadMoments().then(()=>{if(MODE==="deck"&&DECK.mode==="changes")momShow();});
+}
+async function momAdvance(n){
+  const target=DECK.momIdx+n;
+  if(target<0)return;
+  const ok=await momEnsure(target);
+  if(!ok){if(DECK.dom)DECK.dom.saved.textContent="✓ end — "+DECK.moments.length+" moments reviewed";return;}
+  DECK.momIdx=target;momShow();
+}
+async function momSave(){
+  const dom=DECK.dom;if(!dom)return;
+  const m=DECK.moments[DECK.momIdx];if(!m)return;
+  let text=dom.ta.value.trim();
+  if(!text){momAdvance(1);return;}   // empty Enter = skip forward
+  // a moment comment is filed on the representative frame; note the span it covers.
+  if((m.count||1)>1){
+    text+="\n\n(covers moment "+(m.start_ts||"")+"–"+(m.end_ts||"")+", "+m.count+" frames)";
+  }
+  dom.saved.textContent="…";
+  try{
+    await postComment({date:DATE,kind:"frame",frame_id:m.frame_id,session_id:m.session_id||null,comment:text});
+    m.comments=(m.comments||0)+1;dom.ta.value="";
+    momAdvance(1);
+  }catch(err){dom.saved.textContent="✕ "+err.message;}
+}
+// flip the whole deck between moment (changes) and raw (all) views, keeping place
+function toggleDeckMode(){
+  if(DECK.mode==="changes"){
+    const m=DECK.moments[DECK.momIdx];
+    DECK.mode="all";
+    const fid=m?m.frame_id:null;
+    // reset raw walk and jump to the current moment's representative frame
+    DECK.frames=[];DECK.order=[];DECK.offset=0;DECK.total=null;DECK.done=false;DECK.loading=false;DECK.idx=0;
+    render();
+    if(fid!=null)jumpDeck(fid);
+  }else{
+    // find the moment holding the current raw frame (by nearest representative <= idx)
+    DECK.mode="changes";
+    render();
+  }
+}
+// "expand N frames": drop into the raw view at this moment's representative frame
+function expandMoment(m){
+  DECK.mode="all";
+  DECK.frames=[];DECK.order=[];DECK.offset=0;DECK.total=null;DECK.done=false;DECK.loading=false;DECK.idx=0;
+  render();
+  jumpDeck(m.frame_id);
 }
 function deckShow(){
   const dom=DECK.dom;if(!dom)return;
+  if(DECK.mode==="changes")return momShow();
+  dom.heldrow.style.display="none";
   const f=DECK.frames[DECK.idx];
   if(!f){dom.prog.textContent="no frames captured for this day";dom.ctx.textContent="";return;}
   const myseq=(++DECK.seq);
@@ -1855,10 +2382,12 @@ function deckShow(){
   deckPreload();
 }
 function deckPreload(){
+  if(DECK.mode==="changes")return momPreload();
   for(let k=1;k<=3;k++){const nf=DECK.frames[DECK.idx+k];if(nf){const im=new Image();im.src="/frame/"+nf.frame_id+".jpg?full=1";}}
   if(DECK.idx+4>=DECK.frames.length&&!DECK.done)deckLoadPage();
 }
 async function deckAdvance(n){
+  if(DECK.mode==="changes")return momAdvance(n);
   const target=DECK.idx+n;
   if(target<0)return;
   const ok=await deckEnsureLoaded(target);
@@ -1866,6 +2395,7 @@ async function deckAdvance(n){
   DECK.idx=target;deckShow();
 }
 async function deckSave(){
+  if(DECK.mode==="changes")return momSave();
   const dom=DECK.dom;if(!dom)return;
   const f=DECK.frames[DECK.idx];if(!f)return;
   const text=dom.ta.value.trim();
@@ -1878,11 +2408,14 @@ async function deckSave(){
   }catch(err){dom.saved.textContent="✕ "+err.message;}
 }
 function setDeckFilter(sid){
-  DECK.filter=sid;DECK.frames=[];DECK.order=[];DECK.offset=0;DECK.total=null;DECK.done=false;DECK.loading=false;DECK.idx=0;
+  DECK.filter=sid;
+  DECK.frames=[];DECK.order=[];DECK.offset=0;DECK.total=null;DECK.done=false;DECK.loading=false;DECK.idx=0;
+  DECK.moments=[];DECK.momIdx=0;DECK.momTotal=null;DECK.rawTotal=null;DECK.momPartial=false;
+  DECK.momDone=false;DECK.momLoading=false;DECK.skippedIdle=false;DECK.idleFrames=0;
   render();
 }
 async function jumpDeck(fid){
-  MODE="deck";
+  MODE="deck";DECK.mode="all";
   if(DECK.filter!==null){DECK.filter=null;DECK.frames=[];DECK.order=[];DECK.offset=0;DECK.total=null;DECK.done=false;DECK.loading=false;}
   let guard=0,pos=DECK.frames.findIndex(f=>Number(f.frame_id)===Number(fid));
   while(pos<0&&!DECK.done&&guard<400){await deckLoadPage();guard++;pos=DECK.frames.findIndex(f=>Number(f.frame_id)===Number(fid));}
