@@ -280,7 +280,7 @@ def _build_next_event(config: Config, timeline: DayTimeline, date: str, warnings
 
 def _build_week(config: Config, goals, date: str, today_tl: DayTimeline,
                 labels_by_id: dict, rules: list, labels_by_fp: dict,
-                warnings: list[str]) -> dict:
+                warnings: list[str], llm_verdicts: dict | None = None) -> dict:
     """Per-day scores for the trailing WEEK_DAYS, using the SAME corrections-aware,
     min-data-guarded path as the headline (align.score_day) so a day's week cell
     can never contradict its own score. A day below MIN_ACTIVE_MINUTES (or with
@@ -301,7 +301,7 @@ def _build_week(config: Config, goals, date: str, today_tl: DayTimeline,
                 scores.append(None)
                 continue
             day = align_mod.score_day(tl, goals, labels_by_id, rules,
-                                      labels_by_fp=labels_by_fp)
+                                      labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
             scores.append(day["overall"] if day["scored"] else None)
         except Exception as exc:
             _warn(warnings, f"week score for {d} failed ({exc})")
@@ -368,13 +368,29 @@ def build(config: Config, date: str) -> dict:
         _warn(warnings, f"learned rules not loaded ({exc})")
         rules = []
 
+    # local-LLM classification tier: self-heal the day's unresolved sessions
+    # (one batched call at most; a complete cache is a no-op) and load the
+    # verdict cache to fold into every score/attribution below. Never blocks.
+    try:
+        from . import classify as classify_mod
+        from . import intentions as intentions_mod
+
+        intents = intentions_mod.load(config, date)["items"]
+        llm_verdicts = classify_mod.verdicts_for(
+            config, timeline, goals, labels_by_id, rules,
+            labels_by_fp=labels_by_fp, intentions=intents,
+        )
+    except Exception as exc:
+        _warn(warnings, f"llm classification skipped ({exc})")
+        llm_verdicts = {}
+
     from . import align as align_mod
 
     scored = True
     stats = timeline.stats if isinstance(timeline.stats, dict) else {}
     try:
         day = align_mod.score_day(timeline, goals, labels_by_id, rules,
-                                  labels_by_fp=labels_by_fp)
+                                  labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
         alignments = day["alignments"]
         overall = day["overall"]
         scored = day["scored"]
@@ -401,7 +417,8 @@ def build(config: Config, date: str) -> dict:
 
     try:
         review_rows = align_mod.resolve_day(timeline, goals, labels_by_id, rules,
-                                            labels_by_fp=labels_by_fp)
+                                            labels_by_fp=labels_by_fp,
+                                            llm_verdicts=llm_verdicts)
         needs_review = sum(1 for r in review_rows if r["needs_review"])
     except Exception as exc:
         _warn(warnings, f"review summary failed ({exc})")
@@ -425,7 +442,8 @@ def build(config: Config, date: str) -> dict:
     try:
         from . import intentions
 
-        intentions_block = intentions.block(config, date, timeline=timeline, goals=goals)
+        intentions_block = intentions.block(config, date, timeline=timeline, goals=goals,
+                                            llm_verdicts=llm_verdicts)
     except Exception as exc:
         _warn(warnings, f"intentions failed ({exc})")
         intentions_block = {"date": date, "set_at": None, "items": []}
@@ -441,7 +459,7 @@ def build(config: Config, date: str) -> dict:
 
     next_event = _build_next_event(config, timeline, date, warnings)
     week = _build_week(config, goals, date, timeline, labels_by_id, rules,
-                       labels_by_fp, warnings)
+                       labels_by_fp, warnings, llm_verdicts=llm_verdicts)
 
     try:
         health = _build_health(config, date, warnings)

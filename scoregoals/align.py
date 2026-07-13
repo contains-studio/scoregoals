@@ -4,14 +4,22 @@ The deterministic keyword alignment lives in ``compare/align.py``. This module
 sits on top of it and layers in the correction/learning signals from
 ``labels.py`` and ``learn.py``, applying a strict authority order:
 
-    user label  >  learned rule  >  keyword match  >  none
+    user label  >  learned rule  >  keyword match  >  llm  >  none
 
 with calibrated confidences:
 
     label   1.0
     rule    0.9
     keyword 0.6   (0.4 when two+ goals tie on keyword hits — a collision)
+    llm     0.5   (a local-LLM guess — see classify.py; below keyword, above none)
     none    0.2
+
+The ``llm`` tier only fills sessions the deterministic tiers left at source
+``none``: it turns an "unmatched" row into a best-guess suggestion (which beats
+showing nothing), but it is still a guess — ``needs_review`` stays True so the
+review pane surfaces it. A ``not_work`` llm verdict excludes a session from
+active minutes only at confidence >= 0.7 (a low-confidence "personal" guess is
+not trusted enough to silently delete time).
 
 A verdict is a goal id, ``off_track`` (worked but on no goal), or ``not_work``
 (out of scope). ``not_work`` sessions are excluded from active minutes and every
@@ -34,6 +42,8 @@ __all__ = [
     "CONF_RULE",
     "CONF_KEYWORD",
     "CONF_KEYWORD_COLLISION",
+    "CONF_LLM",
+    "CONF_LLM_NOT_WORK_MIN",
     "CONF_NONE",
     "resolve_session",
     "resolve_day",
@@ -62,6 +72,12 @@ SYSTEM_NOISE_APPS: frozenset = frozenset({
 })
 CONF_KEYWORD = 0.6
 CONF_KEYWORD_COLLISION = 0.4
+CONF_LLM = 0.5  # a local-LLM guess (classify.py): below keyword, above none
+# A cached llm verdict is only used to fill a "none" when its own confidence
+# clears this bar (it is still a guess, so it must at least be a confident one).
+CONF_LLM_MIN = 0.5
+# not_work llm verdicts exclude a session from active minutes only at/above this.
+CONF_LLM_NOT_WORK_MIN = 0.7
 CONF_NONE = 0.2
 
 _SPECIAL = (OFF_TRACK, NOT_WORK)
@@ -89,17 +105,24 @@ def resolve_session(
     rules: list[dict],
     date: str | None = None,
     labels_by_fp: dict[tuple[str, int], list[dict]] | None = None,
+    llm_verdicts: dict[str, dict] | None = None,
 ) -> dict:
     """Resolve one session to a verdict with source + confidence + needs_review.
 
     Returns a dict:
       session_id, verdict (goal_id|off_track|not_work|None),
       goal_id, goal_name (None unless verdict is an *active* goal id),
-      source ("label"|"rule"|"keyword"|"none"), confidence, needs_review.
+      source ("label"|"rule"|"keyword"|"llm"|"none"), confidence, needs_review.
 
     `labels_by_fp` (from labels.labels_by_fingerprint) enables a fingerprint
     fallback when the session_id doesn't match a stored label — segmentation can
     re-run and jitter a session's id, and a correction must not silently orphan.
+
+    `llm_verdicts` (from classify.load_verdicts) is the local-LLM guess cache.
+    It is consulted LAST — only when the deterministic tiers would leave the
+    session at source ``none`` — and only when the cached confidence clears
+    CONF_LLM_MIN. The result stays ``needs_review`` (a guess, shown as a
+    suggestion). See the module docstring for the authority order.
     """
     goals_by_id = {g.id: g for g in goals}
     sid = session_id_for(session, date)
@@ -140,6 +163,22 @@ def resolve_session(
                 verdict = kw_id
                 source = "keyword"
                 confidence = CONF_KEYWORD_COLLISION if collision else CONF_KEYWORD
+
+    # llm tier: fill an otherwise-unmatched session from the local-LLM guess
+    # cache (classify.py). Only when nothing deterministic matched (source
+    # "none") and the cached guess is at least CONF_LLM_MIN confident.
+    if source == "none" and llm_verdicts:
+        cached = llm_verdicts.get(sid)
+        if isinstance(cached, dict):
+            try:
+                c_conf = float(cached.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                c_conf = 0.0
+            c_verdict = cached.get("verdict")
+            if c_verdict is not None and c_conf >= CONF_LLM_MIN:
+                verdict = str(c_verdict)
+                source = "llm"
+                confidence = CONF_LLM
 
     # goal_id / goal_name only when the verdict names a real (active) goal.
     goal_id = verdict if verdict not in _SPECIAL and verdict is not None else None
@@ -197,6 +236,7 @@ def resolve_day(
     labels_by_id: dict[str, dict],
     rules: list[dict],
     labels_by_fp: dict[tuple[str, int], list[dict]] | None = None,
+    llm_verdicts: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Resolve every session in the day. Each dict also carries display fields
     (span/app/title/minutes/category). Ordering is uncertain-first: sessions
@@ -205,7 +245,7 @@ def resolve_day(
     out: list[dict] = []
     for s in timeline.sessions:
         r = resolve_session(s, goals, labels_by_id, rules, date=timeline.date,
-                            labels_by_fp=labels_by_fp)
+                            labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
         r.update(
             {
                 "start": s.start,
@@ -219,6 +259,21 @@ def resolve_day(
         out.append(r)
     out.sort(key=lambda r: (not r["needs_review"], -r["minutes"], r["start"]))
     return out
+
+
+def _excludes_from_active(resolved: dict, llm_verdicts: dict | None) -> bool:
+    """Whether a not_work session is excluded from active minutes. A label /
+    system / rule not_work always excludes; an llm not_work excludes only when
+    the MODEL's own confidence (from the cache, not the fixed 0.5 tier
+    confidence) clears CONF_LLM_NOT_WORK_MIN."""
+    if resolved["source"] != "llm":
+        return True
+    cached = (llm_verdicts or {}).get(resolved["session_id"])
+    try:
+        raw_conf = float((cached or {}).get("confidence", 0.0))
+    except (TypeError, ValueError):
+        raw_conf = 0.0
+    return raw_conf >= CONF_LLM_NOT_WORK_MIN
 
 
 def _mk_alignment(gid: str, name: str, minutes: float, total: float,
@@ -237,14 +292,20 @@ def score_day(
     labels_by_id: dict[str, dict],
     rules: list[dict],
     labels_by_fp: dict[tuple[str, int], list[dict]] | None = None,
+    llm_verdicts: dict[str, dict] | None = None,
 ) -> dict:
-    """Recompute the day using labels+rules+keywords.
+    """Recompute the day using labels+rules+keywords+llm.
 
     Returns {overall (int|None), scored (bool), active_minutes (float),
     alignments (list[GoalAlignment])}. not_work sessions are excluded from
     active minutes and all goal math; off_track and unmatched time lands in the
     trailing ``unaligned`` pseudo-goal. When active minutes < MIN_ACTIVE_MINUTES
-    the day is unscored (overall=None, scored=False)."""
+    the day is unscored (overall=None, scored=False).
+
+    An llm-sourced ``not_work`` is trusted to EXCLUDE a session only when its
+    confidence clears CONF_LLM_NOT_WORK_MIN (0.7); a lower-confidence "personal"
+    guess keeps the time in the active total (landing in ``unaligned``) rather
+    than silently deleting it."""
     minutes_by_goal: dict[str, float] = {g.id: 0.0 for g in goals}
     goal_ids = set(minutes_by_goal)
     unaligned = 0.0
@@ -252,9 +313,9 @@ def score_day(
 
     for s in timeline.sessions:
         r = resolve_session(s, goals, labels_by_id, rules, date=timeline.date,
-                            labels_by_fp=labels_by_fp)
+                            labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
         verdict = r["verdict"]
-        if verdict == NOT_WORK:
+        if verdict == NOT_WORK and _excludes_from_active(r, llm_verdicts):
             continue  # out of scope: not active, not scored
         active += s.minutes
         if verdict in goal_ids:

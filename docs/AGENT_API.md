@@ -383,7 +383,10 @@ field tables live in [STATUS_SCHEMA.md](STATUS_SCHEMA.md).
   always exit 0.** This is the agent's default "right now" call.
 - **`scoregoals review [--date D] --json`** — every session for the day resolved
   to a verdict, uncertain-first, with `needs_review` flags and the day `score`.
-  The correction queue.
+  The correction queue. `verdict_source` may be `"llm"`: a local-LLM guess
+  (`scoregoals/classify.py`, cached in `data/llm_verdicts.json`) that fills a
+  session the deterministic tiers left unmatched — still `needs_review: true`,
+  shown as a suggestion. See STATUS_SCHEMA.md for the tier and cache.
 
 ---
 

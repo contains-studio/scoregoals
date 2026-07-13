@@ -66,6 +66,7 @@ DEFAULTS: dict = {
     "nudges_enabled": True,       # nudge honors this
     "capture_paused": False,      # capture honors this (skips when true)
     "refresh_seconds": 30,        # app poll cadence (advisory; used by the app)
+    "llm_classify": True,         # local-LLM classification tier (classify.py) on/off
 }
 
 # Config-key env overrides, keyed by prefix-less SUFFIX. Each suffix is looked up
@@ -81,6 +82,7 @@ _ENV_OVERRIDES: dict[str, str] = {
     "NUDGES_ENABLED": "nudges_enabled",
     "CAPTURE_PAUSED": "capture_paused",
     "REFRESH_SECONDS": "refresh_seconds",
+    "LLM_CLASSIFY": "llm_classify",
 }
 
 # Env-var prefixes in precedence order: primary SCOREGOALS_*, then the legacy
@@ -107,6 +109,7 @@ SETTINGS_KEYS: dict[str, str] = {
     "default_backend": "backend",  # ollama | gemini | both
     "nudges_enabled": "bool",
     "capture_paused": "bool",
+    "llm_classify": "bool",
     "refresh_seconds": "int",
     "ollama_url": "str",
     "gemini_model": "str",
@@ -143,7 +146,7 @@ def _as_backend(value: object) -> str:
 def coerce_setting(key: str, value: object):
     """Coerce a raw (possibly string) value to the type `key` expects."""
     kind = SETTINGS_KEYS.get(key)
-    if kind == "bool" or key in ("nudges_enabled", "capture_paused"):
+    if kind == "bool" or key in ("nudges_enabled", "capture_paused", "llm_classify"):
         return _as_bool(value)
     if kind == "int" or key in ("refresh_seconds", "nudge_threshold_min"):
         return _as_int(value, int(DEFAULTS.get(key, 0) or 0))
@@ -184,6 +187,7 @@ class Config:
     default_backend: str = "ollama"
     nudges_enabled: bool = True
     capture_paused: bool = False
+    llm_classify: bool = True
     refresh_seconds: int = 30
     # screenpipe API auth (the CLI requires Bearer auth for /search since ~v0.4):
     # env SCREENPIPE_API_KEY > settings.json > config.toml > auto `screenpipe auth token`.
@@ -302,6 +306,7 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
         default_backend=_as_backend(values["default_backend"]),
         nudges_enabled=_as_bool(values["nudges_enabled"]),
         capture_paused=_as_bool(values["capture_paused"]),
+        llm_classify=_as_bool(values["llm_classify"]),
         refresh_seconds=_as_int(values["refresh_seconds"], 30),
         screenpipe_api_key=screenpipe_api_key,
         settings_path=str(data_dir / SETTINGS_FILENAME),
@@ -316,6 +321,7 @@ def effective_settings(config: Config) -> dict:
         "default_backend": config.default_backend,
         "nudges_enabled": config.nudges_enabled,
         "capture_paused": config.capture_paused,
+        "llm_classify": config.llm_classify,
         "refresh_seconds": config.refresh_seconds,
         "ollama_url": config.ollama_url,
         "gemini_model": config.gemini_model,

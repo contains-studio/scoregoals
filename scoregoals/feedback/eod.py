@@ -68,11 +68,15 @@ def generate(date: str, config: Config, backend_name: str) -> Report:
     alignments = align.align(timeline, goals)
 
     # Corrections-aware, min-data-guarded score (matches the menu bar headline).
+    # Fold in the cached local-LLM verdicts so the EOD number matches the app.
+    from .. import classify as classify_mod
+
     labels_by_id = labels_mod.labels_by_session(config)
     labels_by_fp = labels_mod.labels_by_fingerprint(config)
     rules = learn_mod.active_rules(config)
+    llm_verdicts = classify_mod.load_verdicts(config)
     day = align_mod.score_day(timeline, goals, labels_by_id, rules,
-                              labels_by_fp=labels_by_fp)
+                              labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
 
     backend = _make_backend(backend_name, config)
     try:

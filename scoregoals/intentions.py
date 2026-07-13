@@ -5,10 +5,14 @@ State lives in data/intentions/<date>.json:
      "items": [{"id": str, "text": str, "goal_id": str|null,
                 "done": bool, "created_at": "ISO"}]}
 
-Each item is best-effort auto-linked to a goal (same keyword logic as the day
-score), which lets `today --json` / `status` attribute today's tracked minutes
-and apps back to the intention. Everything degrades gracefully: no goals, no
-timeline, or a missing file all yield an empty-but-valid block.
+Each item is best-effort auto-linked to a goal — exact keyword match first (the
+same matcher as the day score), then a fuzzy fallback that bridges typos and
+synonyms (so "ship screengoals" links to ``ship-scoregoals``). `today --json` /
+`status` then attribute today's tracked minutes and apps back to the intention
+using the RESOLVED verdicts (label > rule > keyword > llm) — not a raw keyword
+false-match — plus any session the local LLM linked to the intention by id.
+Everything degrades gracefully: no goals, no timeline, or a missing file all
+yield an empty-but-valid block.
 """
 
 from __future__ import annotations
@@ -108,10 +112,71 @@ def _load_goals(config: Config, goals):
     return align.load_goals(config)
 
 
+import difflib
+import re as _re
+
+_FUZZY_THRESHOLD = 0.8
+
+
+def _norm_tokens(s: str | None) -> list[str]:
+    """Lowercased alphanumeric tokens (>= 3 chars) for fuzzy matching."""
+    return [t for t in _re.split(r"[^a-z0-9]+", (s or "").lower()) if len(t) >= 3]
+
+
+def _fuzzy_link(text: str, goals) -> str | None:
+    """Fuzzy fallback for intention→goal linking: match text tokens against each
+    goal's id/name/keyword tokens by edit-distance ratio, so a typo like
+    "ship screengoals" still links to the ``ship-scoregoals`` goal. Returns the
+    best goal id at/above _FUZZY_THRESHOLD, else None."""
+    ttoks = _norm_tokens(text)
+    if not ttoks:
+        return None
+    best_gid: str | None = None
+    best_score = 0.0
+    for g in goals:
+        gtoks = set(_norm_tokens(g.id)) | set(_norm_tokens(g.name))
+        for kw in g.keywords:
+            gtoks |= set(_norm_tokens(kw))
+        if not gtoks:
+            continue
+        score = 0.0
+        for tt in ttoks:
+            r = max(
+                (difflib.SequenceMatcher(None, tt, gt).ratio() for gt in gtoks),
+                default=0.0,
+            )
+            score = max(score, r)
+        if score > best_score:
+            best_gid, best_score = g.id, score
+    return best_gid if best_score >= _FUZZY_THRESHOLD else None
+
+
 def _link(text: str, goals) -> str | None:
+    """Auto-link an intention to a goal: exact keyword match first (identical to
+    the day-score matcher), then a fuzzy fallback that bridges typos/synonyms."""
     from .compare import align
 
-    return align.match_text(text, goals)
+    return align.match_text(text, goals) or _fuzzy_link(text, goals)
+
+
+def relink(config: Config, date: str, goals=None, record: dict | None = None) -> dict:
+    """Fill ``goal_id`` on today's still-UNLINKED items via fuzzy matching and
+    persist if anything changed. Never overwrites an existing link. Returns the
+    (possibly updated) record. This is how "ship screengoals" (set before the
+    fuzzy linker existed) heals into ``ship-scoregoals`` on the next read."""
+    goals = _load_goals(config, goals)
+    if record is None:
+        record = load(config, date)
+    changed = False
+    for it in record["items"]:
+        if not it.get("goal_id"):
+            gid = _link(it.get("text", ""), goals)
+            if gid:
+                it["goal_id"] = gid
+                changed = True
+    if changed:
+        _save(config, date, record)
+    return record
 
 
 def set_items(config: Config, date: str, texts: list[str], goals=None) -> dict:
@@ -258,25 +323,98 @@ def prefill(config: Config, date: str, texts: list[str], goals=None) -> dict:
     return _save(config, date, {"date": date, "set_at": iso_now(), "items": items})
 
 
-def block(config: Config, date: str, timeline=None, goals=None) -> dict:
+def _attribute(config: Config, date: str, timeline, goals, items: list[dict],
+               llm_verdicts: dict | None) -> dict[str, dict]:
+    """Honest per-intention attribution keyed by intention id -> {minutes, apps}.
+
+    A session counts toward AT MOST ONE intention:
+      1. If its ``llm`` verdict carries an ``intention_id`` for one of today's
+         intentions, the WHOLE session goes to that intention (an explicit
+         semantic link — it wins over goal-share).
+      2. Otherwise, if its RESOLVED verdict (label > rule > keyword > llm) names
+         a goal an intention is linked to, its minutes are split evenly across
+         the intentions sharing that goal (so their sum equals the goal's real
+         minutes rather than double-counting).
+    This replaces the old raw token-matching path: minutes now follow the same
+    corrections-aware verdict the score uses, not a keyword false-match.
+    """
+    from . import align as align_mod
+    from . import labels as labels_mod
+    from . import learn as learn_mod
+
+    out: dict[str, dict] = {it["id"]: {"minutes": 0.0, "apps": []} for it in items}
+    if timeline is None or not items:
+        return out
+
+    if llm_verdicts is None:
+        from . import classify as classify_mod
+
+        llm_verdicts = classify_mod.load_verdicts(config)
+
+    all_labels = labels_mod.load_labels(config)
+    labels_by_id = labels_mod.labels_by_session(config, labels=all_labels)
+    labels_by_fp = labels_mod.labels_by_fingerprint(config, labels=all_labels)
+    rules = learn_mod.active_rules(config)
+
+    intent_ids = {it["id"] for it in items}
+    goal_to_intents: dict[str, list[str]] = {}
+    for it in items:
+        gid = it.get("goal_id")
+        if gid:
+            goal_to_intents.setdefault(gid, []).append(it["id"])
+
+    def _add(iid: str, minutes: float, app) -> None:
+        entry = out[iid]
+        entry["minutes"] += minutes
+        if app and app not in entry["apps"]:
+            entry["apps"].append(app)
+
+    for s in timeline.sessions:
+        r = align_mod.resolve_session(
+            s, goals, labels_by_id, rules, date=date,
+            labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts,
+        )
+        mins = float(s.minutes)
+        app = s.app
+        # 1) explicit llm intention link wins (whole session, no goal-share).
+        cached = llm_verdicts.get(r["session_id"]) if llm_verdicts else None
+        cand = cached.get("intention_id") if isinstance(cached, dict) else None
+        if cand in intent_ids:
+            _add(cand, mins, app)
+            continue
+        # 2) goal-share via the resolved (active-goal) verdict.
+        gid = r["goal_id"]
+        sharers = goal_to_intents.get(gid) if gid else None
+        if sharers:
+            share = len(sharers)
+            for iid in sharers:
+                _add(iid, mins / share, app)
+
+    for entry in out.values():
+        entry["minutes"] = round(entry["minutes"], 1)
+    return out
+
+
+def block(config: Config, date: str, timeline=None, goals=None,
+          llm_verdicts: dict | None = None) -> dict:
     """The enriched intentions block for `today --json` / `status`: each item
     gains goal_name, attributed_minutes, and the apps that earned that time
-    today (by matching its goal_id to today's aligned sessions).
+    today.
 
-    A goal's tracked minutes are split **evenly** across the intentions that
-    share its goal_id, so two intentions auto-linked to the same goal each show
-    half its time rather than both claiming the full total (their sum stays
-    equal to the goal's real minutes instead of double-counting). Apps stay
-    shared — the same distinct apps earned that goal's time regardless of how
-    many intentions point at it.
+    Attribution is honest: an intention's minutes are the RESOLVED verdicts of
+    today's sessions (label > rule > keyword > llm), plus any session the local
+    LLM linked to that intention by id — see ``_attribute``. Unlinked items are
+    fuzzily relinked first (so a typo'd intention self-heals), then attributed.
     """
-    from collections import Counter
-
-    from .compare import align
-
     record = load(config, date)
     goals = _load_goals(config, goals)
     goals_by_id = {g.id: g for g in goals}
+
+    # Heal typo'd/unlinked intentions before attributing (persists if changed).
+    try:
+        record = relink(config, date, goals=goals, record=record)
+    except Exception as exc:  # never let relinking break the block
+        _warn(f"relink failed ({exc})")
 
     if timeline is None:
         from .store import load_timeline
@@ -284,22 +422,17 @@ def block(config: Config, date: str, timeline=None, goals=None) -> dict:
         timeline = load_timeline(config, date)
 
     attribution: dict[str, dict] = {}
-    if timeline is not None:
-        try:
-            attribution = align.attribute_sessions(timeline, goals)
-        except Exception as exc:  # never let attribution math break the block
-            _warn(f"attribution failed ({exc})")
-
-    # How many intentions share each goal_id, so we can divide (not duplicate)
-    # that goal's attributed minutes across them.
-    share_counts = Counter(it.get("goal_id") for it in record["items"] if it.get("goal_id"))
+    try:
+        attribution = _attribute(config, date, timeline, goals, record["items"], llm_verdicts)
+    except Exception as exc:  # never let attribution math break the block
+        _warn(f"attribution failed ({exc})")
+        attribution = {it["id"]: {"minutes": 0.0, "apps": []} for it in record["items"]}
 
     items_out: list[dict] = []
     for it in record["items"]:
         gid = it.get("goal_id")
-        attr = attribution.get(gid, {}) if gid else {}
         goal = goals_by_id.get(gid) if gid else None
-        share = share_counts.get(gid, 1) or 1
+        attr = attribution.get(it["id"], {})
         items_out.append(
             {
                 "id": it["id"],
@@ -307,7 +440,7 @@ def block(config: Config, date: str, timeline=None, goals=None) -> dict:
                 "goal_id": gid,
                 "goal_name": goal.name if goal else None,
                 "done": bool(it["done"]),
-                "attributed_minutes": round(float(attr.get("minutes", 0.0)) / share, 1),
+                "attributed_minutes": round(float(attr.get("minutes", 0.0)), 1),
                 "apps": list(attr.get("apps", [])),
                 "carried_from": it.get("carried_from"),
             }

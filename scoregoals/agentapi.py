@@ -418,6 +418,7 @@ def trend_payload(cfg: Config, days: int) -> dict:
     user corrections filed for that day. Reuses align.score_day so each day's
     number matches status/review/EOD exactly."""
     from . import align as align_mod
+    from . import classify as classify_mod
     from . import labels as labels_mod
     from . import learn as learn_mod
     from .compare import align as kw_align
@@ -428,6 +429,7 @@ def trend_payload(cfg: Config, days: int) -> dict:
     labels_by_id = labels_mod.labels_by_session(cfg, labels=all_labels)
     labels_by_fp = labels_mod.labels_by_fingerprint(cfg, labels=all_labels)
     rules = learn_mod.active_rules(cfg)
+    llm_verdicts = classify_mod.load_verdicts(cfg)
 
     # corrections filed per day (user labels only), keyed by the session's day.
     corrections: dict[str, int] = {}
@@ -456,7 +458,8 @@ def trend_payload(cfg: Config, days: int) -> dict:
                 }
             )
             continue
-        day = align_mod.score_day(tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp)
+        day = align_mod.score_day(tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp,
+                                  llm_verdicts=llm_verdicts)
         out_days.append(
             {
                 "date": d,

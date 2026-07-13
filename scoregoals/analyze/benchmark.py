@@ -72,11 +72,14 @@ def run(
     # goal math, so the compare.csv `overall_score` column can't disagree with
     # the app. Below MIN_ACTIVE_MINUTES the day is unscored and the column
     # carries the documented sentinel -1 (see docs/STATUS_SCHEMA.md).
+    from .. import classify as classify_mod
+
     labels_by_id = labels_mod.labels_by_session(config)
     labels_by_fp = labels_mod.labels_by_fingerprint(config)
     rules = learn_mod.active_rules(config)
+    llm_verdicts = classify_mod.load_verdicts(config)
     day = align_mod.score_day(timeline, goals, labels_by_id, rules,
-                              labels_by_fp=labels_by_fp)
+                              labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
     day_scored = day["scored"]
     csv_score = day["overall"] if day_scored else INSUFFICIENT_DATA_SCORE
 

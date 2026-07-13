@@ -56,6 +56,31 @@ def cmd_capture(args: argparse.Namespace) -> int:
     path = save_timeline(cfg, tl)
     total = round(float((tl.stats or {}).get("total_active_minutes", 0)))
     print(f"timeline written: {path} ({len(tl.sessions)} sessions, {total} active min)")
+
+    # Classify the sessions the deterministic tiers left unresolved, so the
+    # popover's score/attribution self-heal on the very next poll (one batched
+    # local-LLM call; cached sessions are never re-asked). Never blocks capture.
+    try:
+        from . import classify as classify_mod
+        from . import intentions as intentions_mod
+        from . import labels as labels_mod
+        from . import learn as learn_mod
+        from .compare import align as kw_align
+
+        goals = kw_align.load_goals(cfg)
+        all_labels = labels_mod.load_labels(cfg)
+        labels_by_id = labels_mod.labels_by_session(cfg, labels=all_labels)
+        labels_by_fp = labels_mod.labels_by_fingerprint(cfg, labels=all_labels)
+        rules = learn_mod.active_rules(cfg)
+        intents = intentions_mod.load(cfg, args.date)["items"]
+        fresh = classify_mod.classify_unresolved(
+            tl, goals, intents, cfg,
+            labels_by_id=labels_by_id, rules=rules, labels_by_fp=labels_by_fp,
+        )
+        if fresh:
+            print(f"classified {len(fresh)} unresolved session(s) via local LLM")
+    except Exception as exc:
+        print(f"warning: llm classification skipped ({exc})", file=sys.stderr)
     return 0
 
 
@@ -255,8 +280,21 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(f"scoregoals: no timeline captured for {d}")
         return 0
 
-    rows = align_mod.resolve_day(tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp)
-    score = align_mod.score_day(tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp)
+    # Self-heal: classify any unresolved sessions the deterministic tiers left
+    # (one batched local-LLM call; cached sessions are never re-asked), then
+    # resolve/score with the llm tier folded in.
+    from . import classify as classify_mod
+    from . import intentions as intentions_mod
+
+    intents = intentions_mod.load(cfg, d)["items"]
+    llm_verdicts = classify_mod.verdicts_for(
+        cfg, tl, goals, labels_by_id, rules, labels_by_fp=labels_by_fp, intentions=intents
+    )
+
+    rows = align_mod.resolve_day(tl, goals, labels_by_id, rules,
+                                 labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
+    score = align_mod.score_day(tl, goals, labels_by_id, rules,
+                                labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
     needs = sum(1 for r in rows if r["needs_review"])
 
     if getattr(args, "json", False):
@@ -347,6 +385,10 @@ def cmd_label(args: argparse.Namespace) -> int:
     rules = learn_mod.active_rules(cfg)
     goal_ids = {g.id for g in goals}
 
+    from . import classify as classify_mod
+
+    llm_verdicts = classify_mod.load_verdicts(cfg)
+
     # Determine the verdict to record.
     if args.goal is not None:
         if args.goal not in goal_ids:
@@ -360,7 +402,7 @@ def cmd_label(args: argparse.Namespace) -> int:
         verdict = NOT_WORK
     else:  # --confirm: accept the current resolved assignment
         cur = align_mod.resolve_session(session, goals, labels_by_id, rules, date=d,
-                                        labels_by_fp=labels_by_fp)
+                                        labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)
         verdict = cur["verdict"]
         if verdict is None:
             print("scoregoals: nothing to confirm — this session has no current "
@@ -375,14 +417,14 @@ def cmd_label(args: argparse.Namespace) -> int:
             return 2
 
     before = align_mod.score_day(tl, goals, labels_by_id, rules,
-                                 labels_by_fp=labels_by_fp)["overall"]
+                                 labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)["overall"]
     labels_mod.record_label(
         cfg, sid, d, labels_mod.fingerprint_for_session(session), verdict, source="user"
     )
     labels_by_id = labels_mod.labels_by_session(cfg)  # reload with the new label
     labels_by_fp = labels_mod.labels_by_fingerprint(cfg)
     after = align_mod.score_day(tl, goals, labels_by_id, rules,
-                                labels_by_fp=labels_by_fp)["overall"]
+                                labels_by_fp=labels_by_fp, llm_verdicts=llm_verdicts)["overall"]
 
     verdict_label = next((g.name for g in goals if g.id == verdict), verdict)
     print(f"labeled {sid} → {verdict_label}   score {_fmt_score(before)} -> {_fmt_score(after)}")

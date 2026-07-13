@@ -74,8 +74,10 @@ null/0/false.
 ### `score` — day score
 
 Scoring now applies the correction/learning layer (`scoregoals/align.py`): user
-labels and learned rules override keyword matches, and `not_work` sessions are
-excluded from active minutes entirely (see the review section). **Min-data
+labels and learned rules override keyword matches, a local-LLM tier fills
+otherwise-unmatched sessions (see `verdict_source` `"llm"` in the review
+section), and `not_work` sessions are excluded from active minutes entirely (see
+the review section). **Min-data
 guard:** below **30** active captured minutes the day is *unscored* — `overall`
 is `null` and `scored` is `false` (honest uncertainty; unknown ≠ off-track). The
 Swift app must treat `overall` as **nullable** and gate on `scored`.
@@ -358,13 +360,14 @@ which never touches `config.toml`) and reads a single value via
 | `default_backend` | string | `"ollama"` \| `"gemini"` \| `"both"` |
 | `nudges_enabled` | bool | `nudge` honors this |
 | `capture_paused` | bool | `capture` skips when true (existing data untouched) |
+| `llm_classify` | bool | local-LLM classification tier on/off (default `true`; see `verdict_source` `"llm"`) |
 | `refresh_seconds` | int | app poll cadence (advisory) |
 | `ollama_url` | string | ollama base URL |
 | `gemini_model` | string | gemini model id |
 
 Environment overrides (highest precedence): `SCOREGOALS_DEFAULT_BACKEND`,
-`SCOREGOALS_NUDGES_ENABLED`, `SCOREGOALS_CAPTURE_PAUSED`, `SCOREGOALS_REFRESH_SECONDS`,
-`SCOREGOALS_OLLAMA_URL`, `SCOREGOALS_GEMINI_MODEL`.
+`SCOREGOALS_NUDGES_ENABLED`, `SCOREGOALS_CAPTURE_PAUSED`, `SCOREGOALS_LLM_CLASSIFY`,
+`SCOREGOALS_REFRESH_SECONDS`, `SCOREGOALS_OLLAMA_URL`, `SCOREGOALS_GEMINI_MODEL`.
 
 ### Example
 
@@ -373,6 +376,7 @@ Environment overrides (highest precedence): `SCOREGOALS_DEFAULT_BACKEND`,
   "default_backend": "ollama",
   "nudges_enabled": true,
   "capture_paused": false,
+  "llm_classify": true,
   "refresh_seconds": 30,
   "ollama_url": "http://localhost:11434",
   "gemini_model": "gemini-3.5-flash"
@@ -455,9 +459,19 @@ printed; `--json` emits the object below. When no timeline exists for the date,
 | `goal_id` | string \| null | resolved **active** goal id; null for `off_track`/`not_work`/unmatched or a verdict naming an archived goal |
 | `goal_name` | string \| null | display name of `goal_id` |
 | `verdict` | string \| null | goal id, `"off_track"`, `"not_work"`, or `null` (unmatched) |
-| `confidence` | number 0–1 | `1.0` label · `0.9` rule · `0.6` keyword (`0.4` on a keyword collision) · `0.2` none |
-| `verdict_source` | string | `"label"` \| `"rule"` \| `"keyword"` \| `"none"` — authority that set the verdict |
-| `needs_review` | bool | `true` unless the verdict came from a user `label` or a learned `rule` |
+| `confidence` | number 0–1 | `1.0` label · `0.9` rule · `0.6` keyword (`0.4` on a keyword collision) · `0.5` llm · `0.2` none |
+| `verdict_source` | string | `"label"` \| `"rule"` \| `"keyword"` \| `"llm"` \| `"none"` — authority that set the verdict |
+| `needs_review` | bool | `true` unless the verdict came from a user `label`, an `implicit` acceptance, a learned `rule`, or a `system` surface (a `keyword` or `llm` guess still needs review) |
+
+**The `llm` tier.** When the deterministic tiers (label > rule > keyword) leave
+a session at source `none`, a local-LLM classifier (`scoregoals/classify.py`)
+may fill it from its cache (`data/llm_verdicts.json`) — source `"llm"`,
+confidence `0.5`. It is a best guess shown as a suggestion (`needs_review` stays
+`true`), which beats showing "unmatched". A `not_work` llm verdict is trusted to
+exclude a session from active minutes only when the model's own confidence is
+≥ 0.7. The tier is gated by the `llm_classify` setting (default `true`) and
+degrades to a no-op when Ollama is unreachable — the deterministic score always
+renders.
 
 ## `scoregoals label <session-id> (--goal <id> | --off-track | --not-work | --confirm)`
 
@@ -517,3 +531,15 @@ Latest line per `session_id` wins. Malformed lines are skipped with a warning.
 `{ "rule": { "app", "title_token", "verdict" }, "created_from": [{ session_id, ts }],
 "created_at" }`. Retired entries add `"reason"` (`contradicted`|`archived-goal`)
 and `"retired_at"`.
+
+**`data/llm_verdicts.json`** — the local-LLM classification cache
+(`scoregoals/classify.py`), an additive, corruption-tolerant map
+`{ session_id: { verdict: goal_id|"off_track"|"not_work"|null, intention_id:
+str|null, confidence: 0-1, model, ts } }`. Populated by a single batched Ollama
+call over the day's UNRESOLVED sessions (source `none` or a low-confidence
+keyword collision) at the end of `capture` and lazily during `status`/`review`.
+A cached session is never re-asked, so status polls stay fast and deterministic
+between captures. `align.resolve_session` consults it LAST — only to fill a
+`none` — as the `"llm"` verdict source. Gated by the `llm_classify` setting;
+when Ollama is unreachable the file is simply not written and the deterministic
+score stands.
