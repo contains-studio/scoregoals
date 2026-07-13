@@ -14,3 +14,6 @@ menubar/ScoreGoals.app/
 # recorder wrapper build products (rebuild with recorder/build.sh)
 recorder/ScreenpipeRecorder.app/
 recorder/ScreenpipeRecorder
+
+# personal goals stay local — goals.example.md is the tracked template
+goals.md
