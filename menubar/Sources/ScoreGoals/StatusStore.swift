@@ -493,6 +493,15 @@ final class StatusStore: ObservableObject {
         loadConfig()
     }
 
+    /// Open the always-on localhost audit page (evidence room + feedback) in the
+    /// default browser. Port comes from the loaded config's audit_port, falling
+    /// back to 5030 (the default the launchd audit service binds).
+    func openAudit() {
+        let port = config?.auditPort ?? 5030
+        guard let url = URL(string: "http://127.0.0.1:\(port)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func openGoalsFile() {
         let url = repoURL.appendingPathComponent("goals.md")
         if FileManager.default.fileExists(atPath: url.path) {

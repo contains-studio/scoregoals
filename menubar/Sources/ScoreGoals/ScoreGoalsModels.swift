@@ -485,6 +485,7 @@ struct ScoreGoalsConfig: Codable, Equatable {
     var nudgesEnabled: Bool = true
     var capturePaused: Bool = false
     var refreshSeconds: Int = 30
+    var auditPort: Int = 5030
     var ollamaUrl: String = ""
     var geminiModel: String = ""
 
@@ -495,6 +496,7 @@ struct ScoreGoalsConfig: Codable, Equatable {
         case nudgesEnabled = "nudges_enabled"
         case capturePaused = "capture_paused"
         case refreshSeconds = "refresh_seconds"
+        case auditPort = "audit_port"
         case ollamaUrl = "ollama_url"
         case geminiModel = "gemini_model"
     }
@@ -505,6 +507,7 @@ struct ScoreGoalsConfig: Codable, Equatable {
         nudgesEnabled = c.tolerant(Bool.self, .nudgesEnabled, true)
         capturePaused = c.tolerant(Bool.self, .capturePaused, false)
         refreshSeconds = c.tolerant(Int.self, .refreshSeconds, 30)
+        auditPort = c.tolerant(Int.self, .auditPort, 5030)
         ollamaUrl = c.tolerant(String.self, .ollamaUrl, "")
         geminiModel = c.tolerant(String.self, .geminiModel, "")
     }

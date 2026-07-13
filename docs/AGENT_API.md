@@ -40,7 +40,8 @@ authority.
 7. [`trend`](#trend) — per-day score/minutes/goals history
 8. [`status` / `review`](#status--review-existing) — the live snapshot & correction queue (existing)
 9. [`audit`](#audit-localhost-evidence-room) — the localhost evidence room (resolution chains, live re-labeling)
-10. [Recipes](#recipes) — how the agent answers common questions
+10. [`feedback`](#feedback-the-human--agent-channel) — structured annotations the user writes, the agent ingests
+11. [Recipes](#recipes) — how the agent answers common questions
 
 ---
 
@@ -428,6 +429,90 @@ human debugging surface, not a machine API, but its JSON endpoints are stable:
   exact `scoregoals label` path (append label → re-mine rules → rescore) and
   returns the fresh day payload. Localhost-only; non-loopback clients are
   rejected.
+- `POST /api/comment {date, kind, session_id?, comment}` — files a structured
+  feedback note (see [`feedback`](#feedback-the-human--agent-channel)). The
+  server enriches a `kind: "session"` note with the session's
+  `{app, title, span, minutes, verdict, source}` from the day data, then appends
+  to `data/feedback/feedback.jsonl`. Returns `{ok: true, entry: {...}}`.
+- `GET /api/feedback[?date=D&status=new]` — the same aggregation
+  `scoregoals feedback --json` returns (see below), for the page's own
+  "N notes for Claude" drawer.
+
+The audit server is **always on** in normal operation: the
+`com.scoregoals.audit` launchd agent runs `scoregoals audit --serve` with
+`RunAtLoad` + `KeepAlive`, binding `127.0.0.1:<audit_port>` (config
+`audit_port`, default 5030). The date defaults to **today per request**, so the
+long-lived process never freezes on the day it started.
+
+---
+
+## `feedback` (the human ↔ agent channel)
+
+**This is THE channel.** The user annotates in the always-on audit page — a 💬
+comment on any session row, a "notes for Claude" box for whole-day thoughts or
+change requests, or a free-floating idea. Each annotation is appended to
+`data/feedback/feedback.jsonl` (append-only, under `data/` — gitignored). A
+checking agent **ingests the new ones, acts, then acks** so processed feedback
+stops resurfacing:
+
+```
+scoregoals feedback --json --new-only   # 1. read unprocessed notes
+# ... act on them (re-label sessions, adjust goals.md, answer a change request) ...
+scoregoals feedback ack                 # 2. mark them acked so they don't resurface
+```
+
+When the user says **"check my feedback"**, run exactly that loop.
+
+**Invocations:**
+
+- `scoregoals feedback [--json] [--date D] [--new-only]` — aggregate the store.
+  `--date` filters to notes *about* that day; `--new-only` keeps only
+  `status: "new"`. JSON is the default output.
+- `scoregoals feedback ack [--before TS]` — flip every `new` entry to `acked`
+  (or, with `--before`, only entries whose `ts` is ≤ that ISO timestamp).
+  Prints `{acked: N, before: TS|null}`.
+
+**`feedback --json` shape:** `{generated_at, count, new_count, entries: [...]}`.
+`count` is the number of returned (filtered) entries; `new_count` is the GLOBAL
+count of unprocessed notes across all dates (drives the page counter). Entries
+are **newest first**.
+
+`entries[]` — one stored annotation:
+
+| field | type | notes |
+|------|------|------|
+| `ts` | string (local ISO) | when the note was filed |
+| `date` | string `YYYY-MM-DD` | the day the note is *about* |
+| `kind` | string | `session` \| `day` \| `idea` |
+| `session_id` | string | present for `kind: session` |
+| `context` | object | present for `kind: session` — server-enriched `{app, title, span, minutes, verdict, source}` at the time the note was filed |
+| `comment` | string | the user's verbatim text |
+| `status` | string | `new` (unprocessed) \| `acked` (processed) |
+
+**Real round-trip** (a session note filed from the audit page, then read back):
+
+```json
+{
+  "generated_at": "2026-07-12T20:16:30-07:00",
+  "count": 1, "new_count": 1,
+  "entries": [
+    {
+      "ts": "2026-07-12T20:16:30-07:00",
+      "date": "2026-07-12",
+      "kind": "session",
+      "session_id": "6c66c14da1ef",
+      "context": { "app": "UserNotificationCenter", "title": null,
+        "span": "00:00-07:30", "minutes": 450.8,
+        "verdict": "not_work", "source": "label" },
+      "comment": "this was actually research, not coding",
+      "status": "new"
+    }
+  ]
+}
+```
+
+`scoregoals feedback ack` then returns `{"acked": 1, "before": null}` and a
+subsequent `feedback --json --new-only` is empty.
 
 ---
 
@@ -487,3 +572,14 @@ accordingly.
 `scoregoals bench --days 14 --json` → compare `backend`, `latency_s`, `cost_usd`
 across rows (same `overall_score` per day by design — backends differ only in
 narrative/cost/latency). `status.health.gemini_cost_today_usd` is today's spend.
+
+### "Check my feedback" / "did he leave me any notes?"
+
+`scoregoals feedback --json --new-only` → read `entries[]`. Each note carries the
+user's `comment`, its `kind` (`session`/`day`/`idea`), and — for a session note —
+the enriched `context` (app, span, minutes, the verdict/source it had when the
+note was written). Act on each: a session note usually means "re-label this"
+(`scoregoals label <session_id> …`); a `day`/`idea` note is a general thought or
+change request to answer. When done, `scoregoals feedback ack` marks them acked
+so they don't resurface. This is the primary way the user steers the system
+between reports — treat a nonzero `new_count` as an inbox.

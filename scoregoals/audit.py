@@ -691,6 +691,11 @@ def _make_handler(cfg: Config):
                     d = (qs.get("date") or [_date.today().isoformat()])[0]
                     sess = (qs.get("session") or [""])[0]
                     self._json(build_frames(cfg, d, sess))
+                elif path == "/api/feedback":
+                    from . import annotations as ann
+                    d = (qs.get("date") or [None])[0]
+                    new_only = (qs.get("status") or [""])[0] == "new"
+                    self._json(ann.aggregate(cfg, date=d, new_only=new_only))
                 elif path.startswith("/frame/"):
                     fid = path[len("/frame/"):]
                     if fid.endswith(".jpg"):
@@ -714,7 +719,7 @@ def _make_handler(cfg: Config):
             if not self._guard():
                 return
             parsed = urlparse(self.path)
-            if parsed.path != "/api/label":
+            if parsed.path not in ("/api/label", "/api/comment"):
                 self._json({"error": "not found"}, status=404)
                 return
             try:
@@ -722,12 +727,27 @@ def _make_handler(cfg: Config):
                 raw = self.rfile.read(length) if length else b"{}"
                 data = json.loads(raw or b"{}")
                 date = str(data.get("date") or _date.today().isoformat())
-                sess = str(data.get("session_id") or "")
-                verdict = str(data.get("verdict") or "")
-                if not sess or not verdict:
-                    self._json({"error": "session_id and verdict required"}, status=400)
+                if parsed.path == "/api/label":
+                    sess = str(data.get("session_id") or "")
+                    verdict = str(data.get("verdict") or "")
+                    if not sess or not verdict:
+                        self._json({"error": "session_id and verdict required"}, status=400)
+                        return
+                    self._json(apply_label(cfg, date, sess, verdict))
                     return
-                self._json(apply_label(cfg, date, sess, verdict))
+                # /api/comment — file a structured feedback note for Claude.
+                from . import annotations as ann
+                kind = str(data.get("kind") or "idea")
+                comment = str(data.get("comment") or "")
+                session_id = data.get("session_id")
+                if not comment.strip():
+                    self._json({"error": "comment is empty"}, status=400)
+                    return
+                entry = ann.append_comment(
+                    cfg, date, kind, comment,
+                    session_id=str(session_id) if session_id else None,
+                )
+                self._json({"ok": True, "entry": entry})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=500)
 
@@ -735,13 +755,30 @@ def _make_handler(cfg: Config):
 
 
 def serve(cfg: Config, date: str, port: int = 5030, open_browser: bool = True) -> int:
-    """Run the audit server (blocking) until Ctrl-C."""
+    """Run the audit server (blocking) until Ctrl-C.
+
+    Binds 127.0.0.1 only. On a bind failure (port already in use — another
+    instance, or a stale one) we log ONE clear line to stderr, sleep 5s so a
+    KeepAlive launchd relaunch can't spin into a tight crash loop, and exit 1.
+    The date defaults to today dynamically PER REQUEST inside the handlers, so a
+    long-lived (always-on) process never gets stuck showing the day it started
+    on — this `date` only seeds the printed URL / the optional browser open."""
+    import time
+
     handler = _make_handler(cfg)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    except OSError as exc:
+        sys.stderr.write(
+            f"[audit] cannot bind 127.0.0.1:{port} ({exc}); another instance is "
+            "likely already serving. Exiting (KeepAlive will retry).\n"
+        )
+        time.sleep(5)  # avoid a tight relaunch loop under launchd KeepAlive
+        return 1
     url = f"http://127.0.0.1:{port}/?date={date}"
-    print(f"scoregoals audit — {url}")
-    print("  the evidence room: every session's resolution chain, live re-labeling.")
-    print("  Ctrl-C to stop.")
+    print(f"scoregoals audit — http://127.0.0.1:{port}/  (starts on {date})")
+    print("  the evidence room: every session's resolution chain, live re-labeling,")
+    print("  and structured feedback for Claude. Ctrl-C to stop.")
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
@@ -838,6 +875,39 @@ PAGE_HTML = r"""<!doctype html>
   .note{color:var(--amber);font-size:12px;margin:4px 0}
   .arch{color:var(--red)}
   .empty{color:var(--muted);padding:40px;text-align:center}
+  /* feedback-for-Claude affordances */
+  .fbcounter{cursor:pointer;background:var(--chip);border:1px solid var(--line);
+    border-radius:999px;padding:3px 11px;font-size:12.5px;color:var(--violet);white-space:nowrap}
+  .fbcounter:hover{border-color:var(--violet);color:var(--ink)}
+  .fbcounter.zero{color:var(--muted)}
+  .daynotes{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:12px 14px;margin-bottom:16px}
+  .daynotes h4{margin:0 0 8px;font-size:11px;letter-spacing:.6px;color:var(--muted);text-transform:uppercase}
+  .cbox{border-top:1px solid var(--line);padding:8px;background:var(--navy2)}
+  textarea.ct{width:100%;background:var(--navy);color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:7px 9px;font:inherit;font-size:12.5px;resize:vertical;min-height:46px}
+  textarea.ct:focus{outline:none;border-color:var(--violet)}
+  .crow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+  .chint{color:var(--muted);font-size:11px}
+  .csaved{color:var(--mint);font-size:11.5px}
+  .existing{margin:4px 0 2px}
+  .cnote{border-left:2px solid var(--violet);padding:3px 0 3px 9px;margin:5px 0;font-size:12.5px}
+  .cnote .cmeta{color:var(--muted);font-size:11px}
+  .cnote.acked{border-left-color:var(--line);opacity:.6}
+  button.cment{color:var(--violet)}
+  button.cment.has{border-color:var(--violet)}
+  /* feedback review drawer */
+  .drawer{position:fixed;top:0;right:0;bottom:0;width:min(560px,92vw);z-index:60;
+    background:var(--navy2);border-left:1px solid var(--line);box-shadow:-16px 0 50px rgba(0,0,0,.5);
+    display:flex;flex-direction:column}
+  .drawer header{position:static;background:var(--panel);border-bottom:1px solid var(--line)}
+  .drawer .dbody{overflow-y:auto;padding:14px 16px;flex:1}
+  .drawer .claudetip{background:rgba(157,140,255,.09);border:1px solid rgba(157,140,255,.4);
+    border-radius:10px;padding:9px 11px;margin-bottom:12px;font-size:12.5px;color:var(--ink)}
+  .drawer .claudetip code{color:var(--mint);font-family:ui-monospace,Menlo,monospace}
+  .dentry{border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin-bottom:10px;background:var(--navy)}
+  .dentry .cmeta{color:var(--muted);font-size:11px;margin-bottom:3px}
+  .dscrim{position:fixed;inset:0;z-index:55;background:rgba(6,10,18,.55)}
   /* real-frame thumbnail strip + lightbox */
   .fstrip{display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px}
   .fthumb{position:relative;flex:0 0 auto;width:150px;height:97px;border:1px solid var(--line);
@@ -876,6 +946,8 @@ PAGE_HTML = r"""<!doctype html>
     <select id="datepick" title="days with a captured timeline"></select>
     <div id="scorebox"></div>
     <div class="meta" id="metabox"></div>
+    <div style="flex:1"></div>
+    <div id="fbcounter" class="fbcounter zero" title="feedback notes for Claude — click to review">✎ 0 notes for Claude</div>
   </div>
 </header>
 <main id="main"><div class="empty">loading…</div></main>
@@ -886,6 +958,7 @@ PAGE_HTML = r"""<!doctype html>
 const qs=new URLSearchParams(location.search);
 let DATE=qs.get("date")||new Date().toISOString().slice(0,10);
 let DAY=null;
+let FB={entries:[],new_count:0};  // feedback for the current date + global new-count
 
 function el(t,c,txt){const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
 function fmtMin(m){return (Math.round(m*10)/10)+"m";}
@@ -899,7 +972,98 @@ async function loadDates(){
 }
 async function load(){
   document.getElementById("main").innerHTML='<div class="empty">loading '+DATE+'…</div>';
-  const r=await fetch("/api/day?date="+encodeURIComponent(DATE));DAY=await r.json();render();
+  const r=await fetch("/api/day?date="+encodeURIComponent(DATE));DAY=await r.json();
+  await loadFeedback();
+  render();
+}
+async function loadFeedback(){
+  // entries for the current date (both new + acked, for the inline history) plus
+  // the GLOBAL new-count for the header counter.
+  try{
+    const r=await fetch("/api/feedback?date="+encodeURIComponent(DATE));
+    FB=await r.json();
+  }catch(e){FB={entries:[],new_count:0};}
+}
+function fbForSession(sid){
+  return (FB.entries||[]).filter(e=>e.kind==="session"&&e.session_id&&
+    (e.session_id===sid||sid.startsWith(e.session_id)||e.session_id.startsWith(sid)));
+}
+function fbForDay(){
+  return (FB.entries||[]).filter(e=>e.kind==="day"||e.kind==="idea");
+}
+function renderCounter(){
+  const c=document.getElementById("fbcounter");if(!c)return;
+  const n=FB.new_count||0;
+  c.textContent="✎ "+n+" note"+(n===1?"":"s")+" for Claude";
+  c.className="fbcounter"+(n?"":" zero");
+  c.onclick=openDrawer;
+}
+async function postComment(payload){
+  const r=await fetch("/api/comment",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(payload)});
+  const j=await r.json();
+  if(j.error)throw new Error(j.error);
+  await loadFeedback();
+  renderCounter();
+  return j.entry;
+}
+// A reusable comment editor: existing notes + textarea + save (S / ⌘Enter).
+function commentEditor(kind, sessionId, opts){
+  opts=opts||{};
+  const wrap=el("div","cbox");
+  const existing=el("div","existing");
+  const notes=kind==="session"?fbForSession(sessionId):fbForDay();
+  notes.forEach(n=>existing.appendChild(renderNote(n)));
+  if(notes.length)wrap.appendChild(existing);
+  const ta=el("textarea","ct");ta.placeholder=opts.placeholder||"a note for Claude — ⌘Enter or Save";
+  ta.onclick=(e)=>e.stopPropagation();
+  wrap.appendChild(ta);
+  const row=el("div","crow");
+  let kindSel=null;
+  if(opts.allowIdea){
+    kindSel=el("select");
+    [["day","about this day"],["idea","general idea"]].forEach(x=>{const o=el("option",null,x[1]);o.value=x[0];kindSel.appendChild(o);});
+    kindSel.onclick=(e)=>e.stopPropagation();
+    row.appendChild(kindSel);
+  }
+  const save=el("button","mini","💬 Save");
+  const saved=el("span","csaved");
+  async function doSave(e){
+    if(e)e.stopPropagation();
+    const text=ta.value.trim();if(!text){ta.focus();return;}
+    save.disabled=true;saved.textContent="…";
+    try{
+      const k=kindSel?kindSel.value:kind;
+      await postComment({date:DATE,kind:k,session_id:sessionId||null,comment:text});
+      ta.value="";saved.textContent="✓ saved — Claude reads these on 'check my feedback'";
+      // refresh the existing-notes list in place
+      const fresh=k==="session"?fbForSession(sessionId):fbForDay();
+      existing.innerHTML="";fresh.forEach(n=>existing.appendChild(renderNote(n)));
+      if(fresh.length&&!existing.parentElement)wrap.insertBefore(existing,ta);
+    }catch(err){saved.textContent="✕ "+err.message;}
+    save.disabled=false;
+    setTimeout(()=>{if(saved.textContent.startsWith("✓"))saved.textContent="";},3500);
+  }
+  save.onclick=doSave;
+  ta.addEventListener("keydown",(e)=>{
+    if((e.metaKey||e.ctrlKey)&&e.key==="Enter"){e.preventDefault();doSave(e);}
+    e.stopPropagation();
+  });
+  row.appendChild(save);
+  row.appendChild(el("span","chint","⌘Enter"));
+  row.appendChild(saved);
+  wrap.appendChild(row);
+  return wrap;
+}
+function renderNote(n){
+  const d=el("div","cnote"+(n.status==="acked"?" acked":""));
+  d.appendChild(document.createTextNode(n.comment||""));
+  const meta=el("div","cmeta");
+  let m=(n.ts||"").slice(0,16).replace("T"," ")+" · "+(n.status||"new");
+  if(n.context&&n.context.verdict)m+=" · was "+n.context.verdict;
+  meta.textContent=m;
+  d.appendChild(meta);
+  return d;
 }
 function render(){
   const d=DAY;
@@ -914,8 +1078,16 @@ function render(){
     Math.round((d.score||{}).project_minutes||0)+"m · "+(d.sessions||[]).length+" sessions<br>"+
     "<span style='color:var(--muted)'>labels "+lc+" · resolved "+rc+"</span>";
 
+  renderCounter();
   const m=document.getElementById("main");m.innerHTML="";
-  if(!d.has_timeline){m.appendChild(el("div","empty","no timeline captured for "+DATE));return;}
+  if(!d.has_timeline){
+    m.appendChild(el("div","empty","no timeline captured for "+DATE));
+    // day/idea notes still make sense on an empty day (a change request for Claude)
+    const dn0=el("div","daynotes");dn0.appendChild(el("h4","","✎ Notes for Claude"));
+    dn0.appendChild(commentEditor("day",null,{allowIdea:true,placeholder:"a thought or change request for Claude — ⌘Enter or Save"}));
+    m.appendChild(dn0);
+    return;
+  }
 
   // archived-label banner
   if((d.archived_label_warnings||[]).length){
@@ -935,6 +1107,12 @@ function render(){
     });
     m.appendChild(b);
   }
+
+  // day notes — a persistent box for general thoughts / change requests for Claude
+  const dn=el("div","daynotes");
+  dn.appendChild(el("h4","","✎ Notes for Claude — this day"));
+  dn.appendChild(commentEditor("day",null,{allowIdea:true,placeholder:"a general thought or change request for Claude — ⌘Enter or Save"}));
+  m.appendChild(dn);
 
   // rollups
   const roll=el("div","rollups");
@@ -1022,6 +1200,9 @@ function detail(s){
   const cf=el("button","mini","✓ confirm");cf.onclick=(e)=>{e.stopPropagation();if(s.final.verdict)doLabel(s.id,s.final.verdict);};
   if(!s.final.verdict)cf.disabled=true;ctr.appendChild(cf);
   const fr=el("button","mini","frames / OCR");fr.onclick=(e)=>{e.stopPropagation();showFrames(s.id,ctr);};ctr.appendChild(fr);
+  const nSess=fbForSession(s.id).length;
+  const cm=el("button","mini cment"+(nSess?" has":""),"💬 comment"+(nSess?" ("+nSess+")":""));
+  cm.onclick=(e)=>{e.stopPropagation();toggleComment(s,ctr);};ctr.appendChild(cm);
   const flash=el("span","flash");flash.id="flash-"+s.id;ctr.appendChild(flash);
   wrap.appendChild(ctr);
   return wrap;
@@ -1062,6 +1243,51 @@ function llmBody(l){
   if(l.overridden)w.appendChild(el("div","note","cached a guess but a higher tier won → not used"));
   else if(l.used)w.appendChild(el("div","meta","this guess was used"));
   return w;
+}
+function toggleComment(s,ctr){
+  let box=ctr.parentElement.querySelector(".cbox");
+  if(box){box.remove();return;}
+  const ed=commentEditor("session",s.id,{placeholder:"a note for Claude about this session — ⌘Enter or Save"});
+  ctr.parentElement.appendChild(ed);
+  const ta=ed.querySelector("textarea");if(ta)ta.focus();
+}
+function openDrawer(){
+  closeDrawer();
+  const scrim=el("div","dscrim");scrim.id="dscrim";scrim.onclick=closeDrawer;
+  document.body.appendChild(scrim);
+  const dr=el("div","drawer");dr.id="drawer";
+  const hd=el("header");const hr=el("div","row");
+  hr.appendChild(el("h1","","✎ Notes for Claude"));
+  const sp=el("div");sp.style.flex="1";hr.appendChild(sp);
+  const copy=el("button","mini","copy JSON");
+  const cls=el("button","mini","✕ close");cls.onclick=closeDrawer;
+  hr.appendChild(copy);hr.appendChild(cls);hd.appendChild(hr);dr.appendChild(hd);
+  const body=el("div","dbody");
+  const tip=el("div","claudetip");
+  tip.innerHTML="Claude reads these automatically — just tell it <b>“check my feedback”</b>. "+
+    "Under the hood it runs <code>scoregoals feedback --json --new-only</code>, acts, then <code>scoregoals feedback ack</code>.";
+  body.appendChild(tip);
+  dr.appendChild(body);document.body.appendChild(dr);
+  // load ALL new entries across dates for the review list
+  fetch("/api/feedback?status=new").then(r=>r.json()).then(j=>{
+    const entries=j.entries||[];
+    copy.onclick=()=>{navigator.clipboard.writeText(JSON.stringify(j,null,2)).then(
+      ()=>{copy.textContent="✓ copied";setTimeout(()=>copy.textContent="copy JSON",1500);});};
+    if(!entries.length){body.appendChild(el("div","meta","no new notes — everything's been acked."));return;}
+    entries.forEach(e=>{
+      const d=el("div","dentry");
+      const meta=el("div","cmeta");
+      let m=(e.ts||"").slice(0,16).replace("T"," ")+" · "+e.kind+" · "+(e.date||"");
+      if(e.context){m+=" · "+(e.context.app||"")+" "+(e.context.span||"");if(e.context.verdict)m+=" ("+e.context.verdict+")";}
+      meta.textContent=m;d.appendChild(meta);
+      d.appendChild(document.createTextNode(e.comment||""));
+      body.appendChild(d);
+    });
+  }).catch(err=>{body.appendChild(el("div","note","could not load: "+err));});
+}
+function closeDrawer(){
+  const d=document.getElementById("drawer");if(d)d.remove();
+  const s=document.getElementById("dscrim");if(s)s.remove();
 }
 async function showFrames(sid,ctr){
   let box=ctr.parentElement.querySelector(".frames");

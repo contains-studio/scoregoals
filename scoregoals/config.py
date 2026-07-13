@@ -67,6 +67,7 @@ DEFAULTS: dict = {
     "capture_paused": False,      # capture honors this (skips when true)
     "refresh_seconds": 30,        # app poll cadence (advisory; used by the app)
     "llm_classify": True,         # local-LLM classification tier (classify.py) on/off
+    "audit_port": 5030,           # port the always-on audit server binds on 127.0.0.1
 }
 
 # Config-key env overrides, keyed by prefix-less SUFFIX. Each suffix is looked up
@@ -83,6 +84,7 @@ _ENV_OVERRIDES: dict[str, str] = {
     "CAPTURE_PAUSED": "capture_paused",
     "REFRESH_SECONDS": "refresh_seconds",
     "LLM_CLASSIFY": "llm_classify",
+    "AUDIT_PORT": "audit_port",
 }
 
 # Env-var prefixes in precedence order: primary SCOREGOALS_*, then the legacy
@@ -111,6 +113,7 @@ SETTINGS_KEYS: dict[str, str] = {
     "capture_paused": "bool",
     "llm_classify": "bool",
     "refresh_seconds": "int",
+    "audit_port": "int",
     "ollama_url": "str",
     "gemini_model": "str",
     "projects_dir": "str",  # scanned for local git activity (setup writes this)
@@ -189,6 +192,7 @@ class Config:
     capture_paused: bool = False
     llm_classify: bool = True
     refresh_seconds: int = 30
+    audit_port: int = 5030
     # screenpipe API auth (the CLI requires Bearer auth for /search since ~v0.4):
     # env SCREENPIPE_API_KEY > settings.json > config.toml > auto `screenpipe auth token`.
     screenpipe_api_key: str | None = None
@@ -308,6 +312,7 @@ def _build(values: dict, raw: dict, base: Path) -> Config:
         capture_paused=_as_bool(values["capture_paused"]),
         llm_classify=_as_bool(values["llm_classify"]),
         refresh_seconds=_as_int(values["refresh_seconds"], 30),
+        audit_port=_as_int(values["audit_port"], 5030),
         screenpipe_api_key=screenpipe_api_key,
         settings_path=str(data_dir / SETTINGS_FILENAME),
         raw=raw,
@@ -323,6 +328,7 @@ def effective_settings(config: Config) -> dict:
         "capture_paused": config.capture_paused,
         "llm_classify": config.llm_classify,
         "refresh_seconds": config.refresh_seconds,
+        "audit_port": config.audit_port,
         "ollama_url": config.ollama_url,
         "gemini_model": config.gemini_model,
         "projects_dir": config.projects_dir,

@@ -1175,16 +1175,47 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
-    """audit [--date] [--port] [--no-browser]: serve the localhost evidence room."""
+    """audit [--date] [--port] [--no-browser] [--serve]: serve the localhost
+    evidence room. --serve is the always-on mode (launchd): never opens a
+    browser and binds the configured audit_port unless --port overrides."""
     cfg = _cfg(args)
     from . import audit as audit_mod
 
     d = getattr(args, "date", None) or _today()
-    return audit_mod.serve(
-        cfg, d,
-        port=int(getattr(args, "port", 5030)),
-        open_browser=not getattr(args, "no_browser", False),
-    )
+    serve_mode = getattr(args, "serve", False)
+    # --serve: default to the configured audit_port and never open a browser.
+    if getattr(args, "port", None) is not None:
+        port = int(args.port)
+    else:
+        port = int(cfg.audit_port)
+    open_browser = not getattr(args, "no_browser", False)
+    if serve_mode:
+        open_browser = False
+    return audit_mod.serve(cfg, d, port=port, open_browser=open_browser)
+
+
+def cmd_feedback(args: argparse.Namespace) -> int:
+    """feedback [--json] [--date D] [--new-only]: the structured feedback channel
+    the checking agent ingests. Aggregates data/feedback/feedback.jsonl."""
+    cfg = _cfg(args)
+    from . import annotations as ann
+
+    d = getattr(args, "date", None)
+    new_only = bool(getattr(args, "new_only", False))
+    _print_json(ann.aggregate(cfg, date=d, new_only=new_only))
+    return 0
+
+
+def cmd_feedback_ack(args: argparse.Namespace) -> int:
+    """feedback ack [--before TS]: flip processed feedback new -> acked so it
+    stops resurfacing. Prints {acked: N} as JSON."""
+    cfg = _cfg(args)
+    from . import annotations as ann
+
+    before = getattr(args, "before", None)
+    n = ann.ack(cfg, before=before)
+    _print_json({"acked": n, "before": before})
+    return 0
 
 
 # --- parser / main -----------------------------------------------------------
@@ -1376,11 +1407,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
     p.set_defaults(func=cmd_trend)
 
-    p = sub.add_parser("audit", help="serve the localhost evidence room (resolution chains, live re-labeling)")
-    p.add_argument("--date", help="YYYY-MM-DD (default: today)")
-    p.add_argument("--port", type=int, default=5030, help="port to bind on 127.0.0.1 (default: 5030)")
+    p = sub.add_parser("audit", help="serve the localhost evidence room (resolution chains, live re-labeling, feedback)")
+    p.add_argument("--date", help="YYYY-MM-DD (default: today; endpoints default to today per request)")
+    p.add_argument("--port", type=int, default=None,
+                   help="port to bind on 127.0.0.1 (default: config audit_port, 5030)")
     p.add_argument("--no-browser", action="store_true", help="don't auto-open a browser")
+    p.add_argument("--serve", action="store_true",
+                   help="always-on mode (launchd): serve forever, no browser, config audit_port")
     p.set_defaults(func=cmd_audit)
+
+    # feedback — the structured audit-page annotations, THE channel Claude reads
+    p_fb = sub.add_parser("feedback", help="structured feedback from the audit page (JSON for Claude)")
+    p_fb.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
+    p_fb.add_argument("--date", metavar="YYYY-MM-DD", help="only feedback about this day")
+    p_fb.add_argument("--new-only", action="store_true", help="only status=new entries (unprocessed)")
+    p_fb.set_defaults(func=cmd_feedback)
+    fb_sub = p_fb.add_subparsers(dest="feedback_action", metavar="action")
+    q = fb_sub.add_parser("ack", help="flip processed feedback new -> acked")
+    q.add_argument("--before", metavar="TS", help="only entries with ts <= this ISO timestamp")
+    q.set_defaults(func=cmd_feedback_ack)
 
     p = sub.add_parser("doctor", help="check external tools + services, print a checklist")
     p.set_defaults(func=cmd_doctor)

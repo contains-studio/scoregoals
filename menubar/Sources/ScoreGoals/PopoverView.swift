@@ -563,6 +563,7 @@ struct PopoverView: View {
                 actionButton("Capture", "camera.viewfinder", key: "capture") { store.captureNow() }
                 actionButton("EOD", "doc.text", key: "report") { store.generateReport() }
                 actionButton("Plan", "sun.max", key: "plan") { store.planDay() }
+                actionButton("Audit", "magnifyingglass", key: "audit") { store.openAudit() }
                 actionButton("Refresh", "arrow.clockwise", key: "refresh") { store.refresh(); store.loadReview() }
             }
             if let msg = store.actionMessage {

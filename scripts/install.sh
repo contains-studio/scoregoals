@@ -28,7 +28,7 @@ LOG_DIR="$HOME/Library/Logs/scoregoals"
 UV_BIN="$HOME/.local/bin/uv"
 [ -x "$UV_BIN" ] || UV_BIN="uv"
 
-AGENTS="com.scoregoals.morning com.scoregoals.eod com.scoregoals.weekly com.scoregoals.nudge"
+AGENTS="com.scoregoals.morning com.scoregoals.eod com.scoregoals.weekly com.scoregoals.nudge com.scoregoals.audit"
 
 # Legacy pre-rebrand labels — cleaned up on uninstall so anyone who loaded the
 # old com.dayloop.* agents ends up with a clean slate after the rename.
@@ -118,7 +118,8 @@ echo "    Schedules:"
 echo "      morning  com.scoregoals.morning  07:30 daily   -> scoregoals plan"
 echo "      eod      com.scoregoals.eod      21:00 daily   -> scoregoals capture <today> && report <today> --backend ollama"
 echo "      weekly   com.scoregoals.weekly   Sun 20:00     -> scoregoals weekly"
-echo "      nudge    com.scoregoals.nudge    every 20 min  -> scoregoals nudge"
+echo "      nudge    com.scoregoals.nudge    every 20 min  -> scoregoals nudge
+      audit    com.scoregoals.audit    always-on     -> scoregoals audit --serve (127.0.0.1:audit_port)"
 echo ""
 echo "    Verify:     launchctl list | grep com.scoregoals"
 echo "    Uninstall:  scripts/install.sh uninstall"

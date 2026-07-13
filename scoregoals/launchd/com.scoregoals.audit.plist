@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scoregoals.audit</string>
+
+    <!--
+      Always-on localhost evidence room + feedback channel.
+      `audit --serve` binds config audit_port (default 5030) on 127.0.0.1,
+      never opens a browser, and serves forever. RunAtLoad + KeepAlive keep it
+      up across logins/crashes; on a port-in-use bind failure the process logs a
+      clear line, sleeps 5s (so KeepAlive can't tight-loop), and exits 1.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__SCOREGOALS_BIN__</string>
+        <string>audit</string>
+        <string>--serve</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__SCOREGOALS_REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__SCOREGOALS_BINDIR__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/scoregoals/audit.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/scoregoals/audit.log</string>
+</dict>
+</plist>
