@@ -395,9 +395,13 @@ def build(config: Config, date: str) -> dict:
         overall = day["overall"]
         scored = day["scored"]
         active_minutes = day["active_minutes"]
+        projects_out = day.get("projects", [])
+        project_minutes = day.get("project_minutes", 0.0)
     except Exception as exc:
         _warn(warnings, f"scoring failed ({exc})")
         alignments, overall, scored = [], None, False
+        projects_out = []
+        project_minutes = 0.0
         try:
             active_minutes = round(float(stats.get("total_active_minutes", 0) or 0), 1)
         except (TypeError, ValueError):
@@ -477,8 +481,12 @@ def build(config: Config, date: str) -> dict:
             "scored": scored,
             "on_track": bool(scored and overall is not None and overall >= ON_TRACK_SCORE),
             "active_minutes": active_minutes,
+            "project_minutes": project_minutes,
         },
         "goals": goals_out,
+        # Tracked projects (name + minutes only — no target, no judgment). A
+        # separate top-level key so goals[] stays goals-only for the menu bar.
+        "projects": projects_out,
         "drift_flags": drift,
         "review": {"needs_review": needs_review},
         "corrections_this_week": corrections_week,

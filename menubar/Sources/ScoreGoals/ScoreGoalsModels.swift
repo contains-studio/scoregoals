@@ -32,6 +32,7 @@ struct ScoreGoalsStatus: Codable {
     var now: Now = Now()
     var score: Score = Score()
     var goals: [GoalRow] = []
+    var projects: [ProjectRow] = []
     var driftFlags: [String] = []
     var review: Review = Review()
     var correctionsThisWeek: Int = 0
@@ -49,7 +50,7 @@ struct ScoreGoalsStatus: Codable {
         case schemaVersion = "schema_version"
         case date
         case generatedAt = "generated_at"
-        case now, score, goals
+        case now, score, goals, projects
         case driftFlags = "drift_flags"
         case review
         case correctionsThisWeek = "corrections_this_week"
@@ -67,6 +68,7 @@ struct ScoreGoalsStatus: Codable {
         now = c.tolerant(Now.self, .now, Now())
         score = c.tolerant(Score.self, .score, Score())
         goals = c.tolerant([GoalRow].self, .goals, [])
+        projects = c.tolerant([ProjectRow].self, .projects, [])
         driftFlags = c.tolerant([String].self, .driftFlags, [])
         review = c.tolerant(Review.self, .review, Review())
         correctionsThisWeek = c.tolerant(Int.self, .correctionsThisWeek, 0)
@@ -234,6 +236,37 @@ struct GoalRow: Codable, Identifiable {
         pctTime = c.tolerant(Double.self, .pctTime, 0)
         targetPct = c.optional(Double.self, .targetPct)
         onTrack = c.tolerant(Bool.self, .onTrack, true)
+    }
+}
+
+// MARK: - projects[]
+
+/// One tracked project from `status.projects` — name + minutes only. Projects
+/// carry NO target and NO judgment (see align.score_day): the popover shows them
+/// as accounted time under the goals, without a tint or a progress bar.
+struct ProjectRow: Codable, Identifiable {
+    var projectId: String = ""
+    var projectName: String = ""
+    var minutes: Double = 0
+    var pctTime: Double = 0
+
+    var id: String { projectId }
+
+    init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case projectName = "project_name"
+        case minutes
+        case pctTime = "pct_time"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        projectId = c.tolerant(String.self, .projectId, "")
+        projectName = c.tolerant(String.self, .projectName, "")
+        minutes = c.tolerant(Double.self, .minutes, 0)
+        pctTime = c.tolerant(Double.self, .pctTime, 0)
     }
 }
 

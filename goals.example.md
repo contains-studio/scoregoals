@@ -49,3 +49,13 @@ target_pct: 10
 Deliberate input: market/chart review (TradingView watchlists), technical
 reading, and research that feeds current projects. Passive entertainment
 (YouTube autoplay, doomscrolling) does NOT count.
+
+## Project: Example project
+keywords: side-project, sideproject, tinkering
+A "## Project:" section is TRACKED but never JUDGED. It takes the same
+keywords/archived fields as a goal but NO target_pct — a project has no target.
+Its keywords still claim matching sessions (so that time resolves to the
+project instead of "unaligned"), and those minutes count as active time, but
+they are excluded from the unaligned share and from the day score. Use projects
+for real work you want accounted without turning it into a scored obligation.
+Label a session onto a project with `scoregoals label <id> --goal <project-id>`.

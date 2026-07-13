@@ -39,7 +39,8 @@ authority.
 6. [`reports`](#reports) — stored EOD/weekly/morning reports
 7. [`trend`](#trend) — per-day score/minutes/goals history
 8. [`status` / `review`](#status--review-existing) — the live snapshot & correction queue (existing)
-9. [Recipes](#recipes) — how the agent answers common questions
+9. [`audit`](#audit-localhost-evidence-room) — the localhost evidence room (resolution chains, live re-labeling)
+10. [Recipes](#recipes) — how the agent answers common questions
 
 ---
 
@@ -376,17 +377,46 @@ These predate this API but are core to it, so they're summarized here; the full
 field tables live in [STATUS_SCHEMA.md](STATUS_SCHEMA.md).
 
 - **`scoregoals status --json`** — one live snapshot: `now` (current activity),
-  `score` (`overall` nullable, `scored`, `on_track`, `active_minutes`), per-goal
-  `goals[]`, `drift_flags[]`, `review.needs_review`, `corrections_this_week`,
-  `learning`, `intentions`, `focus`, `next_event`, `week` (7-day scores +
-  sparkline), and `health` (services, cost, disk, toggles). **Never crashes,
-  always exit 0.** This is the agent's default "right now" call.
+  `score` (`overall` nullable, `scored`, `on_track`, `active_minutes`,
+  `project_minutes`), per-goal `goals[]`, tracked `projects[]`
+  (`{project_id, project_name, minutes, pct_time}` — accounted, not judged;
+  excluded from the `unaligned` share and from `overall`), `drift_flags[]`,
+  `review.needs_review`, `corrections_this_week`, `learning`, `intentions`,
+  `focus`, `next_event`, `week` (7-day scores + sparkline), and `health`
+  (services, cost, disk, toggles). **Never crashes, always exit 0.** This is the
+  agent's default "right now" call.
 - **`scoregoals review [--date D] --json`** — every session for the day resolved
   to a verdict, uncertain-first, with `needs_review` flags and the day `score`.
-  The correction queue. `verdict_source` may be `"llm"`: a local-LLM guess
-  (`scoregoals/classify.py`, cached in `data/llm_verdicts.json`) that fills a
-  session the deterministic tiers left unmatched — still `needs_review: true`,
-  shown as a suggestion. See STATUS_SCHEMA.md for the tier and cache.
+  The correction queue. Each session carries `kind` (`"goal"` | `"project"` |
+  `null`) for its resolved verdict. `verdict_source` may be `"llm"`: a local-LLM
+  guess (`scoregoals/classify.py`, cached in `data/llm_verdicts.json`) that fills
+  a session the deterministic tiers left unmatched — still `needs_review: true`,
+  shown as a suggestion. `label --goal <id>` accepts a project id as well as a
+  goal id. See STATUS_SCHEMA.md for the tier and cache.
+
+## `audit` (localhost evidence room)
+
+`scoregoals audit [--date D] [--port 5030] [--no-browser]` serves a small,
+self-contained web app on **127.0.0.1** (stdlib `http.server`, no new deps) that
+shows the full resolution chain for every session — label > rule > keyword > llm
+> none — with the matched keyword tokens, the llm cache row (even when
+overridden), the goal + project rollup, intention-attribution math, and a
+one-click re-file for user labels that point at archived/removed goals. It is a
+human debugging surface, not a machine API, but its JSON endpoints are stable:
+
+- `GET /api/day?date=D` — the day payload: `sessions[]` each with `final`
+  (verdict/source/confidence/needs_review) and `chain` (`label`, `rule`,
+  `keyword.hits`, `llm`, `system_noise`), plus `goals[]`, `projects[]`,
+  `archived_label_warnings[]`, `intentions`, `label_counts`, `resolution_counts`.
+- `GET /api/frames?session=ID` — frame references for a session's span. Probes
+  the running screenpipe for a live image route and proxies it via `/frame/<id>`
+  when present; otherwise returns the redacted OCR text timeline with an honest
+  note (screenpipe 0.4.25 keeps frames inside rolling `.mp4` chunks, not as
+  per-frame images — the page never fabricates one).
+- `POST /api/label {date, session_id, verdict}` — records a correction via the
+  exact `scoregoals label` path (append label → re-mine rules → rescore) and
+  returns the fresh day payload. Localhost-only; non-loopback clients are
+  rejected.
 
 ---
 

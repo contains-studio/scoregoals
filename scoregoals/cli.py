@@ -318,6 +318,7 @@ def cmd_review(args: argparse.Namespace) -> int:
                         "minutes": r["minutes"],
                         "goal_id": r["goal_id"],
                         "goal_name": r["goal_name"],
+                        "kind": r.get("kind"),  # "goal" | "project" | null (additive)
                         "verdict": r["verdict"],
                         "confidence": r["confidence"],
                         "verdict_source": r["source"],
@@ -744,6 +745,7 @@ def _goals_payload(cfg: Config) -> dict:
                 "keywords": g.keywords,
                 "target_pct": g.target_pct,
                 "archived": g.archived,
+                "kind": g.kind,  # "goal" | "project" (additive)
             }
             for g in goals
         ],
@@ -759,8 +761,9 @@ def _print_goals_summary(payload: dict) -> None:
     for g in goals:
         tgt = f" (target {g['target_pct']:.0f}%)" if g.get("target_pct") is not None else ""
         flag = " [archived]" if g.get("archived") else ""
+        kind = " [project]" if g.get("kind") == "project" else ""
         kws = ", ".join(g.get("keywords") or [])
-        print(f"  - {g['id']}: {g['name']}{tgt}{flag}")
+        print(f"  - {g['id']}: {g['name']}{kind}{tgt}{flag}")
         if kws:
             print(f"      keywords: {kws}")
 
@@ -1171,6 +1174,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    """audit [--date] [--port] [--no-browser]: serve the localhost evidence room."""
+    cfg = _cfg(args)
+    from . import audit as audit_mod
+
+    d = getattr(args, "date", None) or _today()
+    return audit_mod.serve(
+        cfg, d,
+        port=int(getattr(args, "port", 5030)),
+        open_browser=not getattr(args, "no_browser", False),
+    )
+
+
 # --- parser / main -----------------------------------------------------------
 
 
@@ -1359,6 +1375,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--days", type=int, metavar="N", default=14, help="days to include (default 14)")
     p.add_argument("--json", action="store_true", help="emit JSON (this is the default output)")
     p.set_defaults(func=cmd_trend)
+
+    p = sub.add_parser("audit", help="serve the localhost evidence room (resolution chains, live re-labeling)")
+    p.add_argument("--date", help="YYYY-MM-DD (default: today)")
+    p.add_argument("--port", type=int, default=5030, help="port to bind on 127.0.0.1 (default: 5030)")
+    p.add_argument("--no-browser", action="store_true", help="don't auto-open a browser")
+    p.set_defaults(func=cmd_audit)
 
     p = sub.add_parser("doctor", help="check external tools + services, print a checklist")
     p.set_defaults(func=cmd_doctor)

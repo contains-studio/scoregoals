@@ -180,7 +180,8 @@ def resolve_session(
                 source = "llm"
                 confidence = CONF_LLM
 
-    # goal_id / goal_name only when the verdict names a real (active) goal.
+    # goal_id / goal_name only when the verdict names a real (active) goal OR
+    # project (both live in goals_by_id — a project id is a valid verdict).
     goal_id = verdict if verdict not in _SPECIAL and verdict is not None else None
     goal = goals_by_id.get(goal_id) if goal_id else None
     return {
@@ -188,6 +189,9 @@ def resolve_session(
         "verdict": verdict,
         "goal_id": goal_id,
         "goal_name": goal.name if goal else None,
+        # "goal" | "project" for a resolved section id, else None. The scoring
+        # layer uses this to keep project time out of the unaligned share.
+        "kind": (getattr(goal, "kind", "goal") if goal else None),
         "source": source,
         "confidence": round(confidence, 2),
         # Settled signals (user label, implicit acceptance of a completed day,
@@ -297,17 +301,29 @@ def score_day(
     """Recompute the day using labels+rules+keywords+llm.
 
     Returns {overall (int|None), scored (bool), active_minutes (float),
-    alignments (list[GoalAlignment])}. not_work sessions are excluded from
-    active minutes and all goal math; off_track and unmatched time lands in the
-    trailing ``unaligned`` pseudo-goal. When active minutes < MIN_ACTIVE_MINUTES
-    the day is unscored (overall=None, scored=False).
+    alignments (list[GoalAlignment]), projects (list[dict]), project_minutes
+    (float)}. not_work sessions are excluded from active minutes and all goal
+    math; off_track and unmatched time lands in the trailing ``unaligned``
+    pseudo-goal. When active minutes < MIN_ACTIVE_MINUTES the day is unscored
+    (overall=None, scored=False).
+
+    ``goals`` may be a MIXED list of goals and projects (as load_goals returns).
+    A session resolving to a PROJECT id counts as active minutes but is tracked
+    in its own bucket — EXCLUDED from ``unaligned`` and from ``overall_score`` /
+    ``alignments`` — so a project is accounted, never judged. ``alignments``
+    stays goals-only (scored goals + the unaligned pseudo-goal), keeping the
+    status ``goals[]`` shape stable; ``projects`` is the parallel rollup.
 
     An llm-sourced ``not_work`` is trusted to EXCLUDE a session only when its
     confidence clears CONF_LLM_NOT_WORK_MIN (0.7); a lower-confidence "personal"
     guess keeps the time in the active total (landing in ``unaligned``) rather
     than silently deleting it."""
-    minutes_by_goal: dict[str, float] = {g.id: 0.0 for g in goals}
+    scored_goals = _kw.only_goals(goals)
+    projects = _kw.only_projects(goals)
+    minutes_by_goal: dict[str, float] = {g.id: 0.0 for g in scored_goals}
     goal_ids = set(minutes_by_goal)
+    minutes_by_project: dict[str, float] = {p.id: 0.0 for p in projects}
+    project_ids = set(minutes_by_project)
     unaligned = 0.0
     active = 0.0
 
@@ -320,17 +336,29 @@ def score_day(
         active += s.minutes
         if verdict in goal_ids:
             minutes_by_goal[verdict] += s.minutes
+        elif verdict in project_ids:
+            minutes_by_project[verdict] += s.minutes  # tracked, not judged
         else:
             # off_track, unmatched (None), or a verdict naming an archived/removed
-            # goal — all worked-but-unaligned time.
+            # goal — all worked-but-unaligned time. Project time never lands here.
             unaligned += s.minutes
 
     active = round(active, 1)
     alignments = [
         _mk_alignment(g.id, g.name, minutes_by_goal[g.id], active, g.target_pct)
-        for g in goals
+        for g in scored_goals
     ]
     alignments.append(_mk_alignment(_kw.UNALIGNED_ID, _kw.UNALIGNED_NAME, unaligned, active, None))
+
+    projects_out = [
+        {
+            "project_id": p.id,
+            "project_name": p.name,
+            "minutes": round(minutes_by_project[p.id], 1),
+            "pct_time": round((minutes_by_project[p.id] / active * 100.0) if active > 0 else 0.0, 1),
+        }
+        for p in projects
+    ]
 
     scored = active >= MIN_ACTIVE_MINUTES
     overall = _kw.overall_score(alignments) if scored else None
@@ -339,4 +367,6 @@ def score_day(
         "scored": scored,
         "active_minutes": active,
         "alignments": alignments,
+        "projects": projects_out,
+        "project_minutes": round(sum(minutes_by_project.values()), 1),
     }

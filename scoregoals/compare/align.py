@@ -11,8 +11,22 @@ goals.md format:
     archived: true            (optional — retires the goal, see below)
     <free-text description paragraph(s)>
 
-Archived goals are parsed but excluded from alignment/targets/drift by default;
-load_goals(include_archived=True) returns them too (each Goal carries .archived).
+    ## Project: <name>
+    keywords: a, b, c
+    archived: true            (optional)
+    <free-text description paragraph(s)>
+
+A ``## Project:`` section is TRACKED but never JUDGED: it carries the same
+fields as a goal (minus target_pct — a project has no target) and its keywords
+participate in resolution exactly like a goal's, so a session about the project
+resolves to the project id instead of "unaligned". But project time is excluded
+from the unaligned share and from overall_score — it is accounted, not scored.
+Each parsed Goal carries ``.kind`` ("goal" | "project").
+
+Archived goals/projects are parsed but excluded from alignment/targets/drift by
+default; load_goals(include_archived=True) returns them too (each Goal carries
+.archived). ``load_goals`` returns BOTH kinds — callers that want only scored
+goals filter on ``.kind`` (or use ``only_goals`` / ``load_projects``).
 
 Matching strategy (see align()):
     Each Session is assigned to AT MOST ONE goal. A goal matches a session
@@ -57,20 +71,29 @@ def _slug(name: str) -> str:
     return s or "goal"
 
 
-def load_goals(config: Config, include_archived: bool = False) -> list[Goal]:
-    """Parse config.goals_path (goals.md) into Goals.
+_HEADING_RE = re.compile(r"^##\s*(Goal|Project)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
-    Recognized inside each "## Goal: <name>" section:
+
+def load_goals(config: Config, include_archived: bool = False) -> list[Goal]:
+    """Parse config.goals_path (goals.md) into Goals AND Projects.
+
+    Recognized inside each "## Goal: <name>" / "## Project: <name>" section:
       - "keywords: a, b, c"  -> lowercased, stripped, comma-split
-      - "target_pct: 30"     -> float (invalid values ignored with a warning)
-      - "archived: true"     -> bool; archived goals are retired
+      - "target_pct: 30"     -> float (GOALS only; ignored with a warning on a
+                                project, which has no target)
+      - "archived: true"     -> bool; archived goals/projects are retired
       - any other non-heading text -> appended to the description
-    id is a slug of the name; duplicate slugs get -2, -3, ... suffixes.
+    id is a slug of the name; duplicate slugs (across BOTH kinds) get -2, -3, …
+    suffixes, so a goal and a project can never collide on id.
     Missing/unreadable file -> one-line warning + [] (pipeline continues).
 
-    By default only ACTIVE goals are returned (archived ones are excluded from
-    alignment/targets/drift). Pass include_archived=True to get every goal with
-    its `.archived` flag set (used by the `goals --json` editing surface).
+    Returns BOTH kinds (each Goal carries ``.kind`` == "goal" | "project"):
+    callers that score only target-bearing goals filter with ``only_goals`` (or
+    ``g.kind == "goal"``); ``load_projects`` is the project-only convenience.
+
+    By default only ACTIVE goals/projects are returned (archived ones are
+    excluded from alignment/targets/drift). Pass include_archived=True to get
+    every one with its `.archived` flag set (the `goals --json` editing surface).
     """
     try:
         with open(config.goals_path, encoding="utf-8") as fh:
@@ -91,28 +114,32 @@ def load_goals(config: Config, include_archived: bool = False) -> list[Goal]:
             goals.append(current)
         current, desc_lines = None, []
 
-    heading_re = re.compile(r"^##\s*Goal\s*:\s*(.+?)\s*$", re.IGNORECASE)
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
-        m = heading_re.match(line)
+        m = _HEADING_RE.match(line)
         if m:
             _finish()
-            name = m.group(1)
+            kind = "project" if m.group(1).lower() == "project" else "goal"
+            name = m.group(2)
             gid = base = _slug(name)
             n = 2
             while gid in seen_ids:
                 gid, n = f"{base}-{n}", n + 1
             seen_ids.add(gid)
-            current = Goal(id=gid, name=name, description="", keywords=[], target_pct=None)
+            current = Goal(id=gid, name=name, description="", keywords=[],
+                           target_pct=None, kind=kind)
             continue
         if current is None:
-            continue  # preamble before the first goal
+            continue  # preamble before the first section
         stripped = line.strip()
         lower = stripped.lower()
         if lower.startswith("keywords:"):
             kws = [k.strip().lower() for k in stripped.split(":", 1)[1].split(",")]
             current.keywords = [k for k in kws if k]
         elif lower.startswith("target_pct:"):
+            if current.kind == "project":
+                _warn(f"project '{current.name}': target_pct ignored (projects are not scored)")
+                continue
             val = stripped.split(":", 1)[1].strip().rstrip("%")
             try:
                 current.target_pct = float(val)
@@ -132,6 +159,21 @@ def load_goals(config: Config, include_archived: bool = False) -> list[Goal]:
     return goals
 
 
+def only_goals(items: list[Goal]) -> list[Goal]:
+    """The scored, target-bearing goals from a mixed load_goals() list."""
+    return [g for g in items if getattr(g, "kind", "goal") != "project"]
+
+
+def only_projects(items: list[Goal]) -> list[Goal]:
+    """The tracked-but-not-judged projects from a mixed load_goals() list."""
+    return [g for g in items if getattr(g, "kind", "goal") == "project"]
+
+
+def load_projects(config: Config, include_archived: bool = False) -> list[Goal]:
+    """Convenience: just the ``## Project:`` sections from goals.md."""
+    return only_projects(load_goals(config, include_archived=include_archived))
+
+
 def set_archived(config: Config, goal_id: str, archived: bool) -> bool:
     """Toggle the `archived:` flag on the goals.md section whose slug id equals
     `goal_id`, editing the markdown in place with an atomic temp-file + rename.
@@ -148,7 +190,7 @@ def set_archived(config: Config, goal_id: str, archived: bool) -> bool:
         _warn(f"goals file not readable ({config.goals_path}): {exc}")
         return False
 
-    heading_re = re.compile(r"^##\s*Goal\s*:\s*(.+?)\s*$", re.IGNORECASE)
+    heading_re = _HEADING_RE  # matches both "## Goal:" and "## Project:"
     archived_re = re.compile(r"^\s*archived\s*:", re.IGNORECASE)
 
     lines = text.splitlines(keepends=True)
@@ -161,8 +203,9 @@ def set_archived(config: Config, goal_id: str, archived: bool) -> bool:
     for raw in lines:
         m = heading_re.match(raw.rstrip("\n"))
         if m:
-            # New section begins — resolve its id the same way load_goals does.
-            gid = base = _slug(m.group(1))
+            # New section begins — resolve its id the same way load_goals does
+            # (group(2) is the name; group(1) is the "Goal"/"Project" kind).
+            gid = base = _slug(m.group(2))
             n = 2
             while gid in seen_ids:
                 gid, n = f"{base}-{n}", n + 1
@@ -226,6 +269,27 @@ def _session_haystack(s: Session) -> str:
     return " \n ".join(p for p in parts if p).lower()
 
 
+def keyword_hits_detail(items: list[Goal], session: Session) -> dict[str, list[str]]:
+    """Explainability helper: {goal_or_project_id: [matched keyword tokens]} —
+    WHICH of each item's keywords actually appear in the session haystack (same
+    whole-word-ish rule as _keyword_hits). Items with zero hits are omitted, so
+    the result reads as "these tokens are why this session matched these ids".
+    Used by the audit surface to render the keyword tier of the resolution chain.
+    """
+    hay = _session_haystack(session)
+    out: dict[str, list[str]] = {}
+    if not hay:
+        return out
+    for g in items:
+        matched = [
+            kw for kw in g.keywords
+            if kw and re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])", hay)
+        ]
+        if matched:
+            out[g.id] = matched
+    return out
+
+
 def _match_session(s: Session, goals: list[Goal]) -> str | None:
     """Goal id for this session, or None. Most keyword hits wins; ties break
     by goals order. Deterministic."""
@@ -286,20 +350,30 @@ def align(timeline: DayTimeline, goals: list[Goal]) -> list[GoalAlignment]:
     """Attribute session minutes to goals; each session counts toward at most
     one goal (see module docstring for the matching strategy).
 
+    `goals` may be a mixed list of goals and projects (as load_goals returns).
+    Sessions are matched against BOTH kinds so a project claims its own time, but
+    only GOAL alignments are emitted — a project's minutes are tracked (they stay
+    in the active total) yet EXCLUDED from the trailing "unaligned" share, since a
+    project is accounted, not judged. Returns one GoalAlignment per scored goal in
+    order, plus the trailing "unaligned" pseudo-goal (time on neither goal nor
+    project).
+
     pct_time = minutes / total_active_minutes * 100 (0 when the day is empty).
     on_track = (target_pct is None) or (pct_time >= 0.7 * target_pct).
-    Returns one GoalAlignment per goal in goals order, plus a trailing
-    "unaligned" pseudo-goal entry for time that matched no goal.
     """
     total = _total_minutes(timeline)
-    minutes_by_goal: dict[str, float] = {g.id: 0.0 for g in goals}
+    scored = only_goals(goals)
+    project_ids = {p.id for p in only_projects(goals)}
+    minutes_by_goal: dict[str, float] = {g.id: 0.0 for g in scored}
     unaligned_min = 0.0
     for s in timeline.sessions:
-        gid = _match_session(s, goals)
-        if gid is None:
-            unaligned_min += s.minutes
-        else:
+        gid = _match_session(s, goals)  # match against goals AND projects
+        if gid in minutes_by_goal:
             minutes_by_goal[gid] += s.minutes
+        elif gid in project_ids:
+            continue  # tracked project time: active, but not scored, not unaligned
+        else:
+            unaligned_min += s.minutes
 
     def _mk(gid: str, name: str, minutes: float, target: float | None) -> GoalAlignment:
         pct = (minutes / total * 100.0) if total > 0 else 0.0
@@ -313,7 +387,7 @@ def align(timeline: DayTimeline, goals: list[Goal]) -> list[GoalAlignment]:
             on_track=on_track,
         )
 
-    out = [_mk(g.id, g.name, minutes_by_goal[g.id], g.target_pct) for g in goals]
+    out = [_mk(g.id, g.name, minutes_by_goal[g.id], g.target_pct) for g in scored]
     out.append(_mk(UNALIGNED_ID, UNALIGNED_NAME, unaligned_min, None))
     return out
 

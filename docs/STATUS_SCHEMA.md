@@ -39,7 +39,8 @@ regardless; `--date YYYY-MM-DD` overrides the default (today).
 | `generated_at` | string (ISO) | when this snapshot was produced |
 | `now` | object | current activity (see below) |
 | `score` | object | day score (see below) |
-| `goals` | array of object | per-goal alignment incl. an `unaligned` entry |
+| `goals` | array of object | per-goal alignment incl. an `unaligned` entry (goals only — projects are separate) |
+| `projects` | array of object | tracked projects (see `projects[]`); may be empty |
 | `drift_flags` | array of string | deterministic drift warnings (may be empty) |
 | `review` | object | `{ "needs_review": int }` — low-confidence sessions awaiting a correction today (see `review`) |
 | `corrections_this_week` | int | count of user labels applied in the 7-day window ending `date` |
@@ -87,11 +88,15 @@ Swift app must treat `overall` as **nullable** and gate on `scored`.
 | `overall` | int 0–100 **\| null** | day score; `null` when `scored` is `false` (< 30 active min). When non-null it matches `review`'s score and the EOD report |
 | `scored` | bool | `false` => insufficient captured data (< 30 active min); `overall` is then `null` |
 | `on_track` | bool | `scored && overall != null && overall >= 60` (always `false` when unscored) |
-| `active_minutes` | number | active minutes **after** excluding `not_work` sessions |
+| `active_minutes` | number | active minutes **after** excluding `not_work` sessions (project time is included — a project counts as active) |
+| `project_minutes` | number | subset of `active_minutes` attributed to `## Project:` sections (tracked, not judged) |
 
 ### `goals[]` — per-goal alignment
 
-One entry per goal in `goals.md` order, **plus a trailing `unaligned` entry**.
+One entry per **goal** (`## Goal:`) in `goals.md` order, **plus a trailing
+`unaligned` entry**. Projects (`## Project:`) are **not** here — they have their
+own top-level `projects[]`. Project time is excluded from the `unaligned` share
+(a project is accounted, not judged), so `overall` is unaffected by it.
 
 | field | type | notes |
 |------|------|------|
@@ -101,6 +106,21 @@ One entry per goal in `goals.md` order, **plus a trailing `unaligned` entry**.
 | `pct_time` | number | % of active time (0 when the day is empty) |
 | `target_pct` | number \| null | from `goals.md`; null when untargeted (incl. `unaligned`) |
 | `on_track` | bool | `target_pct is null` or `pct_time >= 0.7 * target_pct` |
+
+### `projects[]` — tracked projects (not judged)
+
+One entry per active `## Project:` section in `goals.md` order (empty when there
+are none). A project's keywords participate in resolution exactly like a goal's
+(so its time resolves to the project id instead of `unaligned`), and a project
+id is a valid `label --goal` verdict — but project minutes are **excluded** from
+the `unaligned` share and from `overall`. Tracked, never scored.
+
+| field | type | notes |
+|------|------|------|
+| `project_id` | string | slug id of the project |
+| `project_name` | string | display name |
+| `minutes` | number | minutes attributed to this project today |
+| `pct_time` | number | % of active time (0 when the day is empty) |
 
 ### `review` and `learning`
 
@@ -183,7 +203,10 @@ scheduled, or the day's events are all in the past). Otherwise:
     "on_task": false, "category": null, "since": null, "minutes": 0.0,
     "source": "unknown"
   },
-  "score": { "overall": 75, "scored": true, "on_track": true, "active_minutes": 304.0 },
+  "score": { "overall": 75, "scored": true, "on_track": true, "active_minutes": 304.0, "project_minutes": 22.0 },
+  "projects": [
+    { "project_id": "herdr", "project_name": "herdr", "minutes": 22.0, "pct_time": 7.2 }
+  ],
   "goals": [
     { "goal_id": "ship-scoregoals", "goal_name": "Ship scoregoals", "minutes": 131.0, "pct_time": 43.1, "target_pct": 35.0, "on_track": true },
     { "goal_id": "deep-work-coding", "goal_name": "Deep work / coding", "minutes": 0.0, "pct_time": 0.0, "target_pct": 50.0, "on_track": false },

@@ -348,6 +348,8 @@ struct PopoverView: View {
 
     /// Active goals for the per-row goal picker (drop the `unaligned` pseudo-goal).
     private var reviewGoals: [GoalRow] { focusGoals }
+    /// Tracked projects, offered in the picker below a divider (valid verdicts).
+    private var reviewProjects: [ProjectRow] { store.status?.projects ?? [] }
 
     /// Pending sessions that already have an assignment `--confirm` can accept.
     private var confirmAllCount: Int { reviewPending.filter { $0.verdict != nil }.count }
@@ -392,7 +394,8 @@ struct PopoverView: View {
         } else {
             let visible = reviewExpanded ? reviewPending : Array(reviewPending.prefix(6))
             ForEach(visible) { session in
-                ReviewRow(session: session, goals: reviewGoals, store: store)
+                ReviewRow(session: session, goals: reviewGoals,
+                          projects: reviewProjects, store: store)
             }
             HStack(spacing: 8) {
                 if reviewPending.count > 6 {
@@ -514,6 +517,17 @@ struct PopoverView: View {
                 Text("no goal data yet")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+            // PROJECTS — tracked time, no target, no judgment. Hidden when empty.
+            if let projects = store.status?.projects, !projects.isEmpty {
+                Text("PROJECTS")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .kerning(0.6)
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 2)
+                ForEach(projects) { project in
+                    ProjectRowView(project: project)
+                }
             }
             if let event = store.status?.nextEvent {
                 HStack(spacing: 6) {
@@ -810,6 +824,29 @@ struct GoalRowView: View {
     private func pct(_ v: Double) -> String { String(Int(v.rounded())) }
 }
 
+/// One project row: a hollow dot + name + minutes. Deliberately quieter than a
+/// goal — no tint judgment, no target, no progress bar (a project is tracked,
+/// not scored).
+struct ProjectRowView: View {
+    let project: ProjectRow
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)
+                .frame(width: 6, height: 6)
+            Text(project.projectName)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Text("\(Int(project.minutes.rounded()))m")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
 // MARK: - Small reusable pieces
 
 /// A thin horizontal progress bar; `fraction` is clamped to 0…1.
@@ -859,6 +896,7 @@ struct WeekBars: View {
 struct ReviewRow: View {
     let session: ReviewSession
     let goals: [GoalRow]
+    var projects: [ProjectRow] = []
     @ObservedObject var store: StatusStore
 
     private var busy: Bool { store.busyActions.contains("label-\(session.id)") }
@@ -902,6 +940,18 @@ struct ReviewRow: View {
                                 store.labelSession(session.id, ["--goal", g.goalId])
                             }
                         }
+                        // Projects are valid verdicts too — offer them below a
+                        // divider (tracked, not judged).
+                        if !projects.isEmpty {
+                            Divider()
+                            Section("Projects") {
+                                ForEach(projects) { p in
+                                    Button(p.projectName) {
+                                        store.labelSession(session.id, ["--goal", p.projectId])
+                                    }
+                                }
+                            }
+                        }
                     } label: {
                         HStack(spacing: 3) {
                             Image(systemName: "tag")
@@ -915,7 +965,7 @@ struct ReviewRow: View {
                     }
                     .menuStyle(.borderlessButton)
                     .font(.caption2)
-                    .disabled(locked || goals.isEmpty)
+                    .disabled(locked || (goals.isEmpty && projects.isEmpty))
 
                     Spacer(minLength: 4)
 

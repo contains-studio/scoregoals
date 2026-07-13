@@ -103,7 +103,16 @@ class DayTimeline:
 
 @dataclass
 class Goal:
-    """One goal parsed from goals.md."""
+    """One goal OR project parsed from goals.md.
+
+    `kind` is "goal" (target-bearing, scored/judged) or "project" (tracked time
+    only — counted as active minutes, excluded from the unaligned share and from
+    overall_score, never judged). Projects carry keywords + optional archived but
+    never a target_pct. Both kinds share this dataclass so the resolution layer
+    (keyword matching, verdicts, labels) treats a project id exactly like a goal
+    id; only the scoring layer (align.score_day / compare.align.align) branches on
+    `kind` to keep project time out of judgment.
+    """
 
     id: str = ""
     name: str = ""
@@ -111,6 +120,7 @@ class Goal:
     keywords: list[str] = field(default_factory=list)
     target_pct: float | None = None
     archived: bool = False  # retired goal: kept in goals.md, excluded from alignment
+    kind: str = "goal"      # "goal" | "project"
 
 
 @dataclass
