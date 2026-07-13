@@ -341,9 +341,55 @@ def available_dates(cfg: Config) -> list[str]:
 
 _SP_DB = Path.home() / ".screenpipe" / "db.sqlite"
 _FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
-_CACHE_CAP_BYTES = 500 * 1024 * 1024   # ~500MB LRU cap on the extracted-frame cache
-_FRAME_MAX = 8                          # thumbnails per session strip
+_CACHE_CAP_BYTES = 2 * 1024 * 1024 * 1024   # ~2GB LRU cap on the extracted-frame cache
+_PAGE_LIMIT = 48                        # frames per grid batch (default page size)
 _THUMB_W = 960                          # max thumbnail width (px)
+
+# --- extraction throughput controls -----------------------------------------
+#
+# The frame grid can request dozens of uncached frames as it scrolls. Two guards
+# keep that from forking 100 ffmpeg processes:
+#   * a semaphore caps CONCURRENT ffmpeg runs (a fast scroll can't stampede).
+#   * a single-flight map ensures two requests for the SAME uncached frame share
+#     one extraction instead of racing two ffmpeg runs at the same cache file.
+_FFMPEG_LIMIT = 3
+_EXTRACT_SEM = threading.Semaphore(_FFMPEG_LIMIT)
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT: dict[str, threading.Lock] = {}
+# concurrency instrumentation (peak is observable for the throughput proof)
+_FF_LOCK = threading.Lock()
+_ff_active = 0
+_ff_peak = 0
+
+
+def _inflight_lock(key: str) -> threading.Lock:
+    """The per-frame single-flight lock (created on first use)."""
+    with _INFLIGHT_LOCK:
+        lk = _INFLIGHT.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _INFLIGHT[key] = lk
+        return lk
+
+
+def _ff_enter() -> int:
+    global _ff_active, _ff_peak
+    with _FF_LOCK:
+        _ff_active += 1
+        if _ff_active > _ff_peak:
+            _ff_peak = _ff_active
+        return _ff_active
+
+
+def _ff_leave() -> None:
+    global _ff_active
+    with _FF_LOCK:
+        _ff_active -= 1
+
+
+def ffmpeg_peak() -> int:
+    """Peak observed concurrent ffmpeg extractions (for the throughput proof)."""
+    return _ff_peak
 
 
 def _sp_connect():
@@ -384,12 +430,83 @@ def _utc_to_local_hm(utc_ts) -> str:
         return _iso_hm(utc_ts)
 
 
-def _even_pick(items: list, k: int) -> list:
-    """Up to k items evenly spaced across the list (endpoints included)."""
-    n = len(items)
-    if n <= k:
-        return list(items)
-    return [items[round(i * (n - 1) / (k - 1))] for i in range(k)]
+def _utc_to_local_hms(utc_ts) -> str:
+    """screenpipe UTC ts -> local 'HH:MM:SS' (second precision for a frame stamp)."""
+    try:
+        dt = datetime.fromisoformat(str(utc_ts))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%H:%M:%S")
+    except Exception:
+        return (str(utc_ts) or "")[11:19]
+
+
+# Columns every frame query needs to resolve + dedupe + extract a row.
+_FRAME_SELECT = (
+    "SELECT f.id, f.timestamp, f.snapshot_path, vc.file_path, f.offset_index, f.video_chunk_id "
+    "FROM frames f LEFT JOIN video_chunks vc ON vc.id = f.video_chunk_id "
+    "WHERE f.timestamp >= ? AND f.timestamp <= ? "
+    "  AND (f.video_chunk_id IS NOT NULL OR f.snapshot_path IS NOT NULL) "
+    "ORDER BY f.timestamp"
+)
+
+
+def _query_frames(conn, lo: str, hi: str) -> list[tuple]:
+    """Every RESOLVABLE frame in [lo, hi] (UTC), chronological, as (frame_id, ts).
+
+    Keeps only frames whose backing file still exists (rolling retention), and
+    de-dupes CONSECUTIVE frames that share the same backing image (same snapshot,
+    or same chunk+offset_index) so a run of identical captures collapses to one.
+    '~' > any digit/'.'/'+', so 'HH:MM:SS~' is an inclusive upper bound over
+    screenpipe's fractional+offset timestamps within that second."""
+    rows = conn.execute(_FRAME_SELECT, (lo, hi + "~")).fetchall()
+    out: list[tuple] = []
+    last_key = None
+    for fid, ts, snap, chunk_path, off, vcid in rows:
+        path = snap if snap else chunk_path
+        if not (path and os.path.exists(path)):
+            continue
+        key = snap if snap else (vcid, off)
+        if key == last_key:
+            continue        # consecutive duplicate of the same backing image
+        last_key = key
+        out.append((fid, ts))
+    return out
+
+
+def frame_ocr(cfg: Config, frame_id, chars: int = 200) -> dict | None:
+    """The frame's local timestamp + a redacted OCR snippet from screenpipe's
+    ``frames.full_text`` (first ``chars`` chars — 200 for the stored snapshot the
+    agent reads, longer for the deck's on-screen OCR panel). Returns None when the
+    db/frame is gone."""
+    from .aggregate.redact import redact_text
+
+    conn = _sp_connect()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT timestamp, full_text FROM frames WHERE id = ?", (int(frame_id),)
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    if not row:
+        return None
+    ts, full = row
+    snippet = " ".join(redact_text(full or "").split())[:chars]
+    return {"frame_ts": _utc_to_local_hms(ts), "utc": str(ts), "ocr_snippet": snippet}
+
+
+def _frame_counts(cfg: Config, date: str) -> dict[int, int]:
+    """Per-frame comment counts for the day (drives the 💬 badges without N+1)."""
+    try:
+        from . import annotations as ann
+
+        return ann.frame_comment_counts(cfg, date)
+    except Exception:
+        return {}
 
 
 def _prune_cache(cache_dir: Path, cap_bytes: int = _CACHE_CAP_BYTES) -> None:
@@ -411,76 +528,12 @@ def _prune_cache(cache_dir: Path, cap_bytes: int = _CACHE_CAP_BYTES) -> None:
             pass
 
 
-def build_frames(cfg: Config, date: str, session_id: str) -> dict:
-    """Real frame thumbnails for a session's span, read from screenpipe's own
-    sqlite. Picks up to 8 evenly-spaced frames whose backing file still exists
-    (rolling retention); returns ``frames: [{frame_id, ts}]``. The redacted OCR
-    text timeline is ALWAYS included below as the text evidence, and becomes the
-    honest fallback when no frames resolve (db missing / retention gap)."""
+def _ocr_timeline(cfg: Config, session) -> list[dict]:
+    """The redacted OCR/ui text timeline for a session span (text evidence that
+    sits below the image grid; the honest fallback when no frames resolve)."""
     from .aggregate.redact import redact_text
-    from .labels import session_id_for
-    from .store import load_timeline
-
-    tl = load_timeline(cfg, date)
-    session = None
-    if tl is not None:
-        for s in tl.sessions:
-            if session_id_for(s, date) == session_id or session_id_for(s, date).startswith(session_id):
-                session = s
-                break
-    if session is None:
-        return {"session": session_id, "error": "session not found",
-                "frames_available": False, "frames": [], "ocr_timeline": []}
-
-    frames_out: list[dict] = []
-    note = ""
-    lo = _local_to_utc(session.start)
-    hi = _local_to_utc(session.end or session.start)
-    conn = _sp_connect()
-    if conn is None:
-        note = ("screenpipe db not found at ~/.screenpipe/db.sqlite — "
-                "showing the OCR text timeline instead.")
-    elif not (lo and hi):
-        conn.close()
-        note = "could not resolve the session's time span — showing the OCR timeline."
-    else:
-        rows: list = []
-        try:
-            # '~' > any digit/'.'/'+', so 'HH:MM:SS~' is an inclusive upper bound
-            # over screenpipe's fractional+offset timestamps within that second.
-            rows = conn.execute(
-                "SELECT f.id, f.timestamp, f.snapshot_path, vc.file_path "
-                "FROM frames f LEFT JOIN video_chunks vc ON vc.id = f.video_chunk_id "
-                "WHERE f.timestamp >= ? AND f.timestamp <= ? "
-                "  AND (f.video_chunk_id IS NOT NULL OR f.snapshot_path IS NOT NULL) "
-                "ORDER BY f.timestamp",
-                (lo, hi + "~"),
-            ).fetchall()
-        except Exception as exc:
-            note = f"screenpipe db query failed ({exc}) — showing the OCR timeline."
-        finally:
-            conn.close()
-        # Keep only frames whose backing file still exists (rolling retention).
-        resolvable = []
-        for fid, ts, snap, chunk_path in rows:
-            path = snap if snap else chunk_path
-            if path and os.path.exists(path):
-                resolvable.append((fid, ts))
-        picked = _even_pick(resolvable, _FRAME_MAX)
-        frames_out = [{"frame_id": fid, "ts": _utc_to_local_hm(ts)} for fid, ts in picked]
-        if frames_out:
-            note = (f"{len(frames_out)} of {len(resolvable)} available frames from "
-                    f"screenpipe's local video store ({len(rows)} indexed for this span).")
-        elif rows and not resolvable:
-            note = (f"all {len(rows)} frames for this span have rolled out of "
-                    "screenpipe's retention window — showing the OCR text timeline.")
-        elif not rows:
-            note = ("no screenpipe frames indexed for this span — "
-                    "showing the OCR text timeline.")
 
     ocr_timeline: list[dict] = []
-    # Try live screenpipe OCR for the span; on any failure fall back to the
-    # session's own stored (already-redacted) excerpt.
     try:
         from .sources import screenpipe as sp
 
@@ -500,15 +553,138 @@ def build_frames(cfg: Config, date: str, session_id: str) -> dict:
         txt = " ".join(redact_text(session.text_excerpt or "").split())[:400]
         ocr_timeline = [{"time": _iso_hm(session.start), "app": session.app,
                          "title": session.title, "text": txt or "(no OCR text captured)"}]
+    return ocr_timeline[:60]
 
-    return {
+
+def build_frames(cfg: Config, date: str, session_id: str,
+                 offset: int = 0, limit: int = _PAGE_LIMIT) -> dict:
+    """A PAGE of real frames for a session's span, read from screenpipe's own
+    sqlite. Returns EVERY resolvable frame in the span (not an 8-sample) as
+    ``frames: [{frame_id, ts, comments}]`` sliced to ``[offset:offset+limit]``,
+    with ``total`` and ``has_more`` so the grid can walk the whole session. Each
+    frame carries its per-frame comment count so 💬 badges render without N+1
+    requests. The redacted OCR text timeline rides on the FIRST page only (kept
+    off later pages so paging stays cheap); it is also the honest fallback when
+    no frame resolves (db missing / retention gap)."""
+    from .labels import session_id_for
+    from .store import load_timeline
+
+    tl = load_timeline(cfg, date)
+    session = None
+    if tl is not None:
+        for s in tl.sessions:
+            if session_id_for(s, date) == session_id or session_id_for(s, date).startswith(session_id):
+                session = s
+                break
+    if session is None:
+        return {"session": session_id, "error": "session not found",
+                "frames_available": False, "frames": [], "total": 0,
+                "offset": offset, "limit": limit, "has_more": False, "ocr_timeline": []}
+
+    note = ""
+    total = 0
+    page: list[dict] = []
+    lo = _local_to_utc(session.start)
+    hi = _local_to_utc(session.end or session.start)
+    conn = _sp_connect()
+    if conn is None:
+        note = ("screenpipe db not found at ~/.screenpipe/db.sqlite — "
+                "showing the OCR text timeline instead.")
+    elif not (lo and hi):
+        conn.close()
+        note = "could not resolve the session's time span — showing the OCR timeline."
+    else:
+        resolvable: list[tuple] = []
+        try:
+            resolvable = _query_frames(conn, lo, hi)
+        except Exception as exc:
+            note = f"screenpipe db query failed ({exc}) — showing the OCR timeline."
+        finally:
+            conn.close()
+        total = len(resolvable)
+        counts = _frame_counts(cfg, date)
+        page = [
+            {"frame_id": fid, "ts": _utc_to_local_hms(ts), "comments": counts.get(int(fid), 0)}
+            for fid, ts in resolvable[offset:offset + limit]
+        ]
+        if total:
+            note = (f"{total} frame{'' if total == 1 else 's'} from screenpipe's "
+                    "local video store for this span.")
+        elif not note:
+            note = ("no resolvable screenpipe frames for this span — "
+                    "showing the OCR text timeline.")
+
+    out = {
         "session": session_id,
         "span": _span(session.start, session.end),
         "app": session.app,
-        "frames_available": bool(frames_out),
-        "frames": frames_out,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
+        "frames_available": bool(page),
+        "frames": page,
         "note": note,
-        "ocr_timeline": ocr_timeline[:60],
+    }
+    # OCR text evidence only on the first page (keeps later pages a pure db slice)
+    out["ocr_timeline"] = _ocr_timeline(cfg, session) if offset == 0 else []
+    return out
+
+
+def build_day_frames(cfg: Config, date: str,
+                     offset: int = 0, limit: int = _PAGE_LIMIT) -> dict:
+    """One continuous, chronological page of EVERY frame for the day across all
+    sessions — the day-level "🖼 All images" grid. Frames are ordered session by
+    session (each session's frames in time order), every frame tagged with its
+    owning ``session_id`` + comment count, and a ``sessions`` map carries each
+    session's ``{app, verdict, span}`` for the grid's section headers."""
+    day = build_day(cfg, date)
+    sessions = day.get("sessions", [])
+    counts = _frame_counts(cfg, date)
+
+    frames: list[dict] = []
+    sessions_meta: dict[str, dict] = {}
+    conn = _sp_connect()
+    if conn is not None:
+        try:
+            for s in sessions:
+                sid = str(s.get("id") or "")
+                lo = _local_to_utc(s.get("start"))
+                hi = _local_to_utc(s.get("end") or s.get("start"))
+                if not (lo and hi):
+                    continue
+                try:
+                    fr = _query_frames(conn, lo, hi)
+                except Exception:
+                    fr = []
+                if not fr:
+                    continue
+                final = s.get("final") or {}
+                sessions_meta[sid] = {
+                    "app": s.get("app"),
+                    "verdict": final.get("verdict_name") or final.get("verdict") or "—",
+                    "span": s.get("span"),
+                }
+                for fid, ts in fr:
+                    frames.append({
+                        "frame_id": fid, "ts": _utc_to_local_hms(ts),
+                        "session_id": sid, "comments": counts.get(int(fid), 0),
+                    })
+        finally:
+            conn.close()
+
+    total = len(frames)
+    page = frames[offset:offset + limit]
+    return {
+        "day": True,
+        "date": date,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + limit < total,
+        "frames_available": bool(page),
+        "frames": page,
+        "sessions": sessions_meta,
     }
 
 
@@ -535,55 +711,70 @@ def extract_frame(cfg: Config, frame_id: str, full: bool = False) -> tuple[int, 
     if cache_file.exists() and cache_file.stat().st_size > 0:
         return 200, "image/jpeg", cache_file.read_bytes()   # CACHE HIT
 
-    conn = _sp_connect()
-    if conn is None:
-        return 404, "application/json", json.dumps({"error": "screenpipe db unavailable"}).encode()
-    try:
-        row = conn.execute(
-            "SELECT f.offset_index, f.snapshot_path, vc.file_path "
-            "FROM frames f LEFT JOIN video_chunks vc ON vc.id = f.video_chunk_id "
-            "WHERE f.id = ?", (fid,)).fetchone()
-    except Exception as exc:
-        return 404, "application/json", json.dumps({"error": f"db query failed: {exc}"}).encode()
-    finally:
-        conn.close()
-    if not row:
-        return 404, "application/json", json.dumps({"error": "frame not found"}).encode()
+    # SINGLE-FLIGHT: two requests for the same uncached frame share ONE
+    # extraction. Whoever loses the lock re-checks the cache and reuses the
+    # image the winner just wrote — no duplicate ffmpeg run at the same file.
+    lock = _inflight_lock(f"{fid}{'_full' if full else ''}")
+    with lock:
+        if cache_file.exists() and cache_file.stat().st_size > 0:
+            return 200, "image/jpeg", cache_file.read_bytes()  # won by another thread
 
-    offset, snapshot_path, chunk_path = row
-    scale = f"scale='min({_THUMB_W},iw)':-2"
+        conn = _sp_connect()
+        if conn is None:
+            return 404, "application/json", json.dumps({"error": "screenpipe db unavailable"}).encode()
+        try:
+            row = conn.execute(
+                "SELECT f.offset_index, f.snapshot_path, vc.file_path "
+                "FROM frames f LEFT JOIN video_chunks vc ON vc.id = f.video_chunk_id "
+                "WHERE f.id = ?", (fid,)).fetchone()
+        except Exception as exc:
+            return 404, "application/json", json.dumps({"error": f"db query failed: {exc}"}).encode()
+        finally:
+            conn.close()
+        if not row:
+            return 404, "application/json", json.dumps({"error": "frame not found"}).encode()
 
-    if snapshot_path and os.path.exists(snapshot_path):
-        if full:
-            # Already a jpg — serve it directly (and cache a copy).
+        offset, snapshot_path, chunk_path = row
+        scale = f"scale='min({_THUMB_W},iw)':-2"
+
+        if snapshot_path and os.path.exists(snapshot_path):
+            if full:
+                # Already a jpg — serve it directly (and cache a copy).
+                try:
+                    data = Path(snapshot_path).read_bytes()
+                    cache_file.write_bytes(data)
+                    _prune_cache(cache_dir)
+                    return 200, "image/jpeg", data
+                except Exception as exc:
+                    return 404, "application/json", json.dumps({"error": str(exc)}).encode()
+            src, vf = snapshot_path, scale
+        elif chunk_path and os.path.exists(chunk_path):
+            sel = f"select=eq(n\\,{int(offset or 0)})"
+            src, vf = chunk_path, (sel if full else f"{sel},{scale}")
+        else:
+            return 404, "application/json", json.dumps(
+                {"error": "frame's video chunk rolled out of retention"}).encode()
+
+        cmd = [_FFMPEG, "-nostdin", "-v", "error", "-i", src]
+        if vf:
+            cmd += ["-vf", vf]
+        cmd += ["-frames:v", "1", "-q:v", "4", str(cache_file), "-y"]
+        # SEMAPHORE: cap CONCURRENT ffmpeg runs so a fast scroll can't fork 100
+        # processes. The peak is logged + observable via ffmpeg_peak().
+        with _EXTRACT_SEM:
+            active = _ff_enter()
+            sys.stderr.write(f"[audit] ffmpeg extract frame={fid}{'_full' if full else ''} concurrency={active}/{_FFMPEG_LIMIT}\n")
             try:
-                data = Path(snapshot_path).read_bytes()
-                cache_file.write_bytes(data)
-                _prune_cache(cache_dir)
-                return 200, "image/jpeg", data
+                subprocess.run(cmd, timeout=10, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception as exc:
-                return 404, "application/json", json.dumps({"error": str(exc)}).encode()
-        src, vf = snapshot_path, scale
-    elif chunk_path and os.path.exists(chunk_path):
-        sel = f"select=eq(n\\,{int(offset or 0)})"
-        src, vf = chunk_path, (sel if full else f"{sel},{scale}")
-    else:
-        return 404, "application/json", json.dumps(
-            {"error": "frame's video chunk rolled out of retention"}).encode()
-
-    cmd = [_FFMPEG, "-nostdin", "-v", "error", "-i", src]
-    if vf:
-        cmd += ["-vf", vf]
-    cmd += ["-frames:v", "1", "-q:v", "4", str(cache_file), "-y"]
-    try:
-        subprocess.run(cmd, timeout=10, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as exc:
-        return 404, "application/json", json.dumps({"error": f"ffmpeg failed: {exc}"}).encode()
-    if not (cache_file.exists() and cache_file.stat().st_size > 0):
-        return 404, "application/json", json.dumps({"error": "extraction produced no image"}).encode()
-    _prune_cache(cache_dir)
-    return 200, "image/jpeg", cache_file.read_bytes()
+                return 404, "application/json", json.dumps({"error": f"ffmpeg failed: {exc}"}).encode()
+            finally:
+                _ff_leave()
+        if not (cache_file.exists() and cache_file.stat().st_size > 0):
+            return 404, "application/json", json.dumps({"error": "extraction produced no image"}).encode()
+        _prune_cache(cache_dir)
+        return 200, "image/jpeg", cache_file.read_bytes()
 
 
 # --- label write (same path as cmd_label) -----------------------------------
@@ -690,7 +881,27 @@ def _make_handler(cfg: Config):
                 elif path == "/api/frames":
                     d = (qs.get("date") or [_date.today().isoformat()])[0]
                     sess = (qs.get("session") or [""])[0]
-                    self._json(build_frames(cfg, d, sess))
+                    try:
+                        offset = max(0, int((qs.get("offset") or ["0"])[0]))
+                    except ValueError:
+                        offset = 0
+                    try:
+                        limit = int((qs.get("limit") or [str(_PAGE_LIMIT)])[0])
+                    except ValueError:
+                        limit = _PAGE_LIMIT
+                    limit = max(1, min(limit, 200))
+                    day_mode = (qs.get("day") or [""])[0] in ("1", "true", "yes")
+                    if day_mode:
+                        self._json(build_day_frames(cfg, d, offset, limit))
+                    else:
+                        self._json(build_frames(cfg, d, sess, offset, limit))
+                elif path == "/api/frame":
+                    fid = (qs.get("id") or [""])[0]
+                    info = frame_ocr(cfg, fid, chars=4000) if fid else None
+                    if info is None:
+                        self._json({"error": "frame not found", "ocr_snippet": ""}, status=404)
+                    else:
+                        self._json({"frame_id": int(fid), **info})
                 elif path == "/api/feedback":
                     from . import annotations as ann
                     d = (qs.get("date") or [None])[0]
@@ -735,17 +946,28 @@ def _make_handler(cfg: Config):
                         return
                     self._json(apply_label(cfg, date, sess, verdict))
                     return
-                # /api/comment — file a structured feedback note for Claude.
+                # /api/comment — file a structured feedback note for Claude
+                # (session | day | idea | frame). A frame note is enriched with
+                # frame_ts + ocr_snippet + the owning session's context.
                 from . import annotations as ann
                 kind = str(data.get("kind") or "idea")
                 comment = str(data.get("comment") or "")
                 session_id = data.get("session_id")
+                frame_id = data.get("frame_id")
                 if not comment.strip():
                     self._json({"error": "comment is empty"}, status=400)
                     return
+                fid_int = None
+                if frame_id is not None:
+                    try:
+                        fid_int = int(frame_id)
+                    except (TypeError, ValueError):
+                        self._json({"error": "bad frame_id"}, status=400)
+                        return
                 entry = ann.append_comment(
                     cfg, date, kind, comment,
                     session_id=str(session_id) if session_id else None,
+                    frame_id=fid_int,
                 )
                 self._json({"ok": True, "entry": entry})
             except Exception as exc:
@@ -908,26 +1130,40 @@ PAGE_HTML = r"""<!doctype html>
   .dentry{border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin-bottom:10px;background:var(--navy)}
   .dentry .cmeta{color:var(--muted);font-size:11px;margin-bottom:3px}
   .dscrim{position:fixed;inset:0;z-index:55;background:rgba(6,10,18,.55)}
-  /* real-frame thumbnail strip + lightbox */
-  .fstrip{display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px}
-  .fthumb{position:relative;flex:0 0 auto;width:150px;height:97px;border:1px solid var(--line);
+  /* real-frame GRID (every frame, lazy, paged) + lightbox */
+  .fgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px;padding:6px 0}
+  .fsection{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:10px 4px 3px;margin-top:4px;border-top:1px solid var(--line);
+    color:var(--muted);font-size:12px}
+  .fsection:first-child{border-top:none;margin-top:0}
+  .fsection .app{color:var(--ink);font-weight:600}
+  .fsection .verdict{color:var(--mint)}
+  .fsection .sp{font-family:ui-monospace,Menlo,monospace}
+  .fthumb{position:relative;height:100px;border:1px solid var(--line);
     border-radius:8px;overflow:hidden;cursor:pointer;background:var(--chip);
     display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px}
   .fthumb:hover{border-color:var(--mint2)}
   .fthumb img{width:100%;height:100%;object-fit:cover;display:block}
   .fthumb.ferr{color:var(--red);font-size:20px;cursor:default}
-  .fskel{width:150px;height:97px;border-radius:8px;flex:0 0 auto;
-    background:linear-gradient(100deg,var(--chip) 30%,var(--navy2) 50%,var(--chip) 70%);
-    background-size:200% 100%;animation:shimmer 1.2s linear infinite}
-  @keyframes shimmer{to{background-position:-200% 0}}
   .fcap{position:absolute;left:0;bottom:0;background:rgba(11,18,32,.78);color:var(--mint);
     font:11px ui-monospace,Menlo,monospace;padding:1px 6px;border-top-right-radius:6px}
-  .ftimeline{margin-top:4px}
+  .fbadge{position:absolute;top:4px;right:4px;background:var(--violet);color:#0b1220;
+    font-size:11px;font-weight:700;border-radius:999px;padding:1px 6px;line-height:1.35;
+    box-shadow:0 1px 4px rgba(0,0,0,.4)}
+  .fgridstatus{color:var(--muted);font-size:11.5px;padding:6px 2px}
+  .fsentinel{height:1px}
+  .ftimeline{margin-top:8px}
   .lightbox{position:fixed;inset:0;z-index:50;background:rgba(6,10,18,.93);
     display:flex;align-items:center;justify-content:center}
-  .lbimg{max-width:92vw;max-height:82vh;border:1px solid var(--line);border-radius:8px;
+  .lbwrap{display:flex;gap:14px;align-items:flex-start;max-width:94vw;max-height:86vh;flex-wrap:wrap}
+  .lbimg{max-width:min(64vw,1100px);max-height:82vh;border:1px solid var(--line);border-radius:8px;
     box-shadow:0 20px 60px rgba(0,0,0,.6);background:var(--navy2)}
-  .lbcap{position:fixed;bottom:16px;left:0;right:0;text-align:center;color:var(--ink);
+  .lbcomments{width:320px;max-width:92vw;max-height:82vh;overflow-y:auto;background:var(--navy2);
+    border:1px solid var(--line);border-radius:10px;padding:12px 13px}
+  .lbctitle{color:var(--violet);font-size:12px;letter-spacing:.4px;text-transform:uppercase;
+    margin-bottom:8px;font-weight:700}
+  .lbclist{margin-bottom:10px}
+  .lbcap{position:fixed;bottom:14px;left:0;right:0;text-align:center;color:var(--ink);
     font:12.5px ui-monospace,Menlo,monospace}
   .lbnav,.lbclose{position:fixed;background:var(--panel);color:var(--ink);border:1px solid var(--line);
     border-radius:10px;cursor:pointer;line-height:1;padding:8px 15px;font-size:24px}
@@ -935,6 +1171,44 @@ PAGE_HTML = r"""<!doctype html>
   .lbprev{left:18px;top:50%;transform:translateY(-50%)}
   .lbnext{right:18px;top:50%;transform:translateY(-50%)}
   .lbclose{top:16px;right:18px;font-size:16px}
+  /* mode segmented control */
+  .modeseg{display:flex;gap:4px}
+  .modeseg button.on{border-color:var(--mint2);color:var(--mint);background:rgba(79,227,193,.08)}
+  /* the review DECK — large-image, keyboard-first, comment-and-advance */
+  .deck{max-width:1180px;margin:0 auto}
+  .deckhead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+  .deckhead .prog{font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,monospace;
+    color:var(--mint);font-size:13px;white-space:nowrap}
+  .deckhead .ctx{color:var(--muted);font-size:12.5px}
+  .deckhead .ctx b{color:var(--ink)}
+  .deckhead .ctx .v{color:var(--mint)}
+  .deckhead .done{color:var(--mint);font-size:12px;border:1px solid var(--mint2);
+    border-radius:999px;padding:1px 9px}
+  .deckdivider{background:rgba(157,140,255,.10);border:1px solid rgba(157,140,255,.4);
+    border-radius:10px;padding:6px 12px;margin-bottom:10px;color:var(--violet);font-size:12.5px}
+  .deckdivider b{color:var(--ink)}
+  .deckstage{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
+  .deckimgwrap{position:relative;flex:1 1 640px;min-width:280px;background:var(--navy2);
+    border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;
+    align-items:center;justify-content:center;min-height:280px}
+  .deckimg{width:100%;height:auto;max-height:74vh;object-fit:contain;display:block}
+  .deckimg.loading{opacity:.35}
+  .deckimgwrap .ferr{color:var(--red);padding:40px;font-size:13px}
+  .deckside{flex:1 1 300px;min-width:260px;max-width:420px;display:flex;flex-direction:column;gap:10px}
+  .deckcbox{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 12px}
+  .deckcbox h4{margin:0 0 7px;font-size:11px;letter-spacing:.5px;color:var(--muted);text-transform:uppercase}
+  .deckcbox textarea.ct{min-height:70px}
+  .deckcrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:7px}
+  .deckhint{color:var(--muted);font-size:11px}
+  .deckexisting{margin-bottom:7px}
+  .deckocr{background:var(--panel);border:1px solid var(--line);border-radius:10px}
+  .deckocr summary{cursor:pointer;padding:9px 12px;font-size:12px;color:var(--muted);
+    letter-spacing:.4px;text-transform:uppercase;user-select:none}
+  .deckocr summary:hover{color:var(--ink)}
+  .deckocr .ocrtext{padding:0 12px 11px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
+    color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:34vh;overflow-y:auto}
+  .decknav{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .decknav .grow{flex:1}
   footer{color:var(--muted);font-size:11.5px;text-align:center;padding:26px 20px 34px;
     max-width:1180px;margin:0 auto;border-top:1px solid var(--line)}
   footer .warn{color:var(--amber)}
@@ -947,6 +1221,11 @@ PAGE_HTML = r"""<!doctype html>
     <div id="scorebox"></div>
     <div class="meta" id="metabox"></div>
     <div style="flex:1"></div>
+    <div class="modeseg" id="modeseg">
+      <button id="mode-deck" class="mini" title="review every screenshot, large, keyboard-first">🎞 Deck</button>
+      <button id="mode-grid" class="mini" title="scroll the whole day as thumbnails">🖼 Grid</button>
+      <button id="mode-audit" class="mini" title="the resolution-chain evidence view">🔍 Audit</button>
+    </div>
     <div id="fbcounter" class="fbcounter zero" title="feedback notes for Claude — click to review">✎ 0 notes for Claude</div>
   </div>
 </header>
@@ -959,6 +1238,10 @@ const qs=new URLSearchParams(location.search);
 let DATE=qs.get("date")||new Date().toISOString().slice(0,10);
 let DAY=null;
 let FB={entries:[],new_count:0};  // feedback for the current date + global new-count
+let MODE="deck";                  // "deck" (landing) | "grid" | "audit"
+// the review-deck state: the whole day's frames, walked chronologically
+let DECK={frames:[],total:null,sessions:{},order:[],idx:0,offset:0,
+          loading:false,done:false,filter:null,seq:0};
 
 function el(t,c,txt){const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
 function fmtMin(m){return (Math.round(m*10)/10)+"m";}
@@ -974,6 +1257,7 @@ async function load(){
   document.getElementById("main").innerHTML='<div class="empty">loading '+DATE+'…</div>';
   const r=await fetch("/api/day?date="+encodeURIComponent(DATE));DAY=await r.json();
   await loadFeedback();
+  resetDeck();     // a fresh day → walk its frames from the top
   render();
 }
 async function loadFeedback(){
@@ -990,6 +1274,9 @@ function fbForSession(sid){
 }
 function fbForDay(){
   return (FB.entries||[]).filter(e=>e.kind==="day"||e.kind==="idea");
+}
+function fbForFrame(fid){
+  return (FB.entries||[]).filter(e=>e.kind==="frame"&&Number(e.frame_id)===Number(fid));
 }
 function renderCounter(){
   const c=document.getElementById("fbcounter");if(!c)return;
@@ -1079,7 +1366,10 @@ function render(){
     "<span style='color:var(--muted)'>labels "+lc+" · resolved "+rc+"</span>";
 
   renderCounter();
+  updateModeButtons();
   const m=document.getElementById("main");m.innerHTML="";
+  if(d.has_timeline && MODE==="deck"){renderDeck(m);return;}
+  if(d.has_timeline && MODE==="grid"){renderAllImages(m);return;}
   if(!d.has_timeline){
     m.appendChild(el("div","empty","no timeline captured for "+DATE));
     // day/idea notes still make sense on an empty day (a change request for Claude)
@@ -1153,7 +1443,16 @@ function render(){
     const srcTd=el("td");const sd=el("div","cell");sd.appendChild(el("span","src "+s.final.source,s.final.source));srcTd.appendChild(sd);tr.appendChild(srcTd);
     tr.appendChild(tdc(Number(s.final.confidence).toFixed(2),"mono"));
     const dtr=el("tr");const dtd=el("td");dtd.colSpan=7;dtd.className="detail";dtd.appendChild(detail(s));dtd.style.display="none";dtr.appendChild(dtd);
-    tr.onclick=()=>{dtd.style.display=dtd.style.display==="none"?"":"none";};
+    tr.onclick=()=>{
+      const opening=dtd.style.display==="none";
+      dtd.style.display=opening?"":"none";
+      // images-first: auto-load the first frame batch the first time a session opens
+      if(opening&&!dtd._framesOpened){
+        dtd._framesOpened=true;
+        const ctr=dtd.querySelector(".controls");
+        if(ctr)showFrames(s.id,ctr,{});
+      }
+    };
     tb.appendChild(tr);tb.appendChild(dtr);
   });
   tbl.appendChild(tb);m.appendChild(tbl);
@@ -1199,7 +1498,7 @@ function detail(s){
     b.onclick=(e)=>{e.stopPropagation();doLabel(s.id,v);};ctr.appendChild(b);});
   const cf=el("button","mini","✓ confirm");cf.onclick=(e)=>{e.stopPropagation();if(s.final.verdict)doLabel(s.id,s.final.verdict);};
   if(!s.final.verdict)cf.disabled=true;ctr.appendChild(cf);
-  const fr=el("button","mini","frames / OCR");fr.onclick=(e)=>{e.stopPropagation();showFrames(s.id,ctr);};ctr.appendChild(fr);
+  const fr=el("button","mini","frames / OCR");fr.onclick=(e)=>{e.stopPropagation();showFrames(s.id,ctr,{toggle:true});};ctr.appendChild(fr);
   const nSess=fbForSession(s.id).length;
   const cm=el("button","mini cment"+(nSess?" has":""),"💬 comment"+(nSess?" ("+nSess+")":""));
   cm.onclick=(e)=>{e.stopPropagation();toggleComment(s,ctr);};ctr.appendChild(cm);
@@ -1289,60 +1588,109 @@ function closeDrawer(){
   const d=document.getElementById("drawer");if(d)d.remove();
   const s=document.getElementById("dscrim");if(s)s.remove();
 }
-async function showFrames(sid,ctr){
-  let box=ctr.parentElement.querySelector(".frames");
-  if(box){box.remove();return;}
-  box=el("div","frames");
-  ctr.parentElement.appendChild(box);
-  // skeleton strip while we resolve real frames
-  const skel=el("div","fstrip");
-  for(let i=0;i<5;i++)skel.appendChild(el("div","fskel"));
-  box.appendChild(skel);
-  let j;
-  try{
-    const r=await fetch("/api/frames?date="+DATE+"&session="+encodeURIComponent(sid));j=await r.json();
-  }catch(e){box.innerHTML="";box.appendChild(el("div","note","could not load frames: "+e));return;}
-  box.innerHTML="";
-  const frames=j.frames||[];
-  if(frames.length){
-    const strip=el("div","fstrip");
-    frames.forEach((f,i)=>{
-      const cell=el("div","fthumb");
-      const img=el("img");img.loading="lazy";img.src="/frame/"+f.frame_id+".jpg";
-      img.alt="frame "+f.frame_id+" @"+(f.ts||"");
-      img.onerror=()=>{cell.classList.add("ferr");cell.textContent="✕";cell.title="frame unavailable";};
-      cell.appendChild(img);cell.appendChild(el("span","fcap",f.ts||""));
-      cell.onclick=(e)=>{e.stopPropagation();openLightbox(frames,i);};
-      strip.appendChild(cell);
-    });
-    box.appendChild(strip);
-  }
-  if(j.note)box.appendChild(el("div","note",j.note));
-  // OCR text timeline stays BELOW as the text evidence
-  const otl=el("div","ftimeline");
-  (j.ocr_timeline||[]).forEach(f=>{
-    const line=el("div","frameline");const t=el("span","t",(f.time||"")+" ");
-    const app=el("b",null,f.app||"");line.appendChild(t);line.appendChild(app);
-    line.appendChild(document.createTextNode(" "+(f.text||"")));otl.appendChild(line);
-  });
-  box.appendChild(otl);
+// ---- shared infinite frame grid (batches of 48, IntersectionObserver) -------
+function renderBadge(f){
+  const b=f._badge;if(!b)return;
+  const n=f.comments||0;
+  if(n>0){b.style.display="";b.textContent="💬"+(n>1?n:"");b.title=n+" comment"+(n===1?"":"s");}
+  else{b.style.display="none";}
 }
+function frameCell(f,framesArr,opts){
+  const cell=el("div","fthumb");
+  const img=el("img");img.loading="lazy";img.src="/frame/"+f.frame_id+".jpg";
+  img.alt="frame "+f.frame_id+" @"+(f.ts||"");
+  img.onerror=()=>{cell.classList.add("ferr");cell.textContent="✕";cell.title="frame unavailable";};
+  cell.appendChild(img);cell.appendChild(el("span","fcap",f.ts||""));
+  const badge=el("span","fbadge");f._badge=badge;cell.appendChild(badge);renderBadge(f);
+  cell.onclick=(e)=>{e.stopPropagation();(opts.onOpen||openLightbox)(framesArr,f._idx,opts);};
+  return cell;
+}
+function sectionHeader(meta){
+  const h=el("div","fsection");
+  h.appendChild(el("span","app",(meta&&meta.app)||"?"));
+  h.appendChild(el("span","verdict",(meta&&meta.verdict)||"—"));
+  h.appendChild(el("span","sp",(meta&&meta.span)||""));
+  return h;
+}
+// container gets grid + post-area + status + a sentinel the observer watches.
+function infiniteGrid(container,fetchPage,opts){
+  opts=opts||{};
+  const grid=el("div","fgrid");container.appendChild(grid);
+  const post=el("div");container.appendChild(post);
+  const status=el("div","fgridstatus","loading…");container.appendChild(status);
+  const sentinel=el("div","fsentinel");container.appendChild(sentinel);
+  const allFrames=[];let offset=0,total=null,loading=false,done=false,lastSession=null,first=true;
+  async function loadMore(){
+    if(loading||done)return;loading=true;status.textContent="loading…";
+    let j;
+    try{j=await fetchPage(offset,48);}catch(e){status.textContent="✕ "+e;loading=false;return;}
+    const frames=j.frames||[];total=(j.total!=null?j.total:total);
+    frames.forEach(f=>{
+      if(opts.sessionId&&!f.session_id)f.session_id=opts.sessionId;
+      if(opts.sections&&f.session_id!==lastSession){
+        lastSession=f.session_id;grid.appendChild(sectionHeader((j.sessions||{})[f.session_id]));
+      }
+      f._idx=allFrames.length;allFrames.push(f);
+      grid.appendChild(frameCell(f,allFrames,opts));
+    });
+    offset+=frames.length;
+    if(first){first=false;if(opts.onFirstPage)opts.onFirstPage(j,post);}
+    if(!j.has_more||frames.length===0){done=true;status.textContent=(total!=null?total+" frame"+(total===1?"":"s"):"")+" · end";}
+    else{status.textContent=allFrames.length+" / "+(total!=null?total:"?")+" — scroll for more";}
+    loading=false;
+  }
+  const io=new IntersectionObserver((ents)=>{ents.forEach(e=>{if(e.isIntersecting)loadMore();});},{rootMargin:"500px"});
+  io.observe(sentinel);
+  loadMore();
+  return {frames:allFrames};
+}
+// ---- session grid (audit-mode session table expander) ----------------------
+function showFrames(sid,ctr,opts){
+  opts=opts||{};
+  let box=ctr.parentElement.querySelector(".frames");
+  if(box){if(opts.toggle)box.remove();return;}
+  box=el("div","frames");ctr.parentElement.appendChild(box);
+  infiniteGrid(box,
+    (off,lim)=>fetch("/api/frames?date="+DATE+"&session="+encodeURIComponent(sid)+"&offset="+off+"&limit="+lim).then(r=>r.json()),
+    {sessionId:sid,onFirstPage:(j,post)=>{
+      if(j.note)post.appendChild(el("div","note",j.note));
+      const otl=el("div","ftimeline");
+      (j.ocr_timeline||[]).forEach(f=>{
+        const line=el("div","frameline");line.appendChild(el("span","t",(f.time||"")+" "));
+        line.appendChild(el("b",null,f.app||""));
+        line.appendChild(document.createTextNode(" "+(f.text||"")));otl.appendChild(line);
+      });
+      post.appendChild(otl);
+    }});
+}
+// ---- day GRID ("🖼 Grid") : click a thumb → jump the deck to that frame -----
+function renderAllImages(m){
+  const box=el("div","allimages");
+  box.appendChild(el("div","meta","every captured frame for "+DATE+", chronological — scroll to load more, click any frame to open it in the deck"));
+  infiniteGrid(box,
+    (off,lim)=>fetch("/api/frames?day=1&date="+DATE+"&offset="+off+"&limit="+lim).then(r=>r.json()),
+    {sections:true,onOpen:(arr,idx)=>jumpDeck(arr[idx].frame_id)});
+  m.appendChild(box);
+}
+// ---- lightbox (used by the session grid) : image + per-frame comments -------
 let LB=null;
-function openLightbox(frames,idx){
-  closeLightbox();
+function openLightbox(frames,idx,opts){
+  opts=opts||{};closeLightbox();
   const ov=el("div","lightbox");ov.id="lightbox";
-  const img=el("img","lbimg");
+  const wrap=el("div","lbwrap");
+  const img=el("img","lbimg");img.onclick=(e)=>e.stopPropagation();
+  const panel=el("div","lbcomments");panel.onclick=(e)=>e.stopPropagation();
+  wrap.appendChild(img);wrap.appendChild(panel);
   const cap=el("div","lbcap");
   const prev=el("button","lbnav lbprev","‹");
   const next=el("button","lbnav lbnext","›");
   const close=el("button","lbclose","✕");
-  LB={frames:frames,idx:idx,img:img,cap:cap};
+  LB={frames:frames,idx:idx,img:img,cap:cap,panel:panel,opts:opts};
   prev.onclick=(e)=>{e.stopPropagation();lbStep(-1);};
   next.onclick=(e)=>{e.stopPropagation();lbStep(1);};
   close.onclick=(e)=>{e.stopPropagation();closeLightbox();};
   ov.onclick=()=>closeLightbox();
-  img.onclick=(e)=>e.stopPropagation();
-  ov.appendChild(close);ov.appendChild(prev);ov.appendChild(img);ov.appendChild(next);ov.appendChild(cap);
+  ov.appendChild(close);ov.appendChild(prev);ov.appendChild(wrap);ov.appendChild(next);ov.appendChild(cap);
   document.body.appendChild(ov);
   document.addEventListener("keydown",lbKey);
   lbShow();
@@ -1351,10 +1699,38 @@ function lbShow(){
   if(!LB)return;const f=LB.frames[LB.idx];
   LB.img.src="/frame/"+f.frame_id+".jpg?full=1";
   LB.cap.textContent="frame "+f.frame_id+" · "+(f.ts||"")+"   ("+(LB.idx+1)+"/"+LB.frames.length+")  — raw, local-only";
+  renderLbComments(f);
+}
+function renderLbComments(f){
+  const p=LB.panel;p.innerHTML="";
+  p.appendChild(el("div","lbctitle","💬 comments · frame "+f.frame_id));
+  const list=el("div","lbclist");
+  const notes=fbForFrame(f.frame_id);
+  if(notes.length)notes.forEach(n=>list.appendChild(renderNote(n)));
+  else list.appendChild(el("div","meta","no comments on this frame yet"));
+  p.appendChild(list);
+  const ta=el("textarea","ct");ta.placeholder="comment on this exact frame — ⌘Enter or Save";
+  ta.onclick=(e)=>e.stopPropagation();
+  const save=el("button","mini","💬 Save");const saved=el("span","csaved");
+  async function doSave(e){
+    if(e)e.stopPropagation();
+    const text=ta.value.trim();if(!text){ta.focus();return;}
+    save.disabled=true;saved.textContent="…";
+    try{
+      const sid=f.session_id||LB.opts.sessionId||null;
+      await postComment({date:DATE,kind:"frame",frame_id:f.frame_id,session_id:sid,comment:text});
+      ta.value="";f.comments=(f.comments||0)+1;renderBadge(f);renderLbComments(f);
+    }catch(err){saved.textContent="✕ "+err.message;save.disabled=false;}
+  }
+  save.onclick=doSave;
+  ta.addEventListener("keydown",(e)=>{if((e.metaKey||e.ctrlKey)&&e.key==="Enter"){e.preventDefault();doSave(e);}e.stopPropagation();});
+  const row=el("div","crow");row.appendChild(save);row.appendChild(el("span","chint","⌘Enter"));row.appendChild(saved);
+  p.appendChild(ta);p.appendChild(row);
 }
 function lbStep(d){if(!LB)return;LB.idx=(LB.idx+d+LB.frames.length)%LB.frames.length;lbShow();}
 function lbKey(e){
   if(!LB)return;
+  if(e.target&&e.target.tagName==="TEXTAREA"){if(e.key==="Escape")closeLightbox();return;}
   if(e.key==="Escape")closeLightbox();
   else if(e.key==="ArrowLeft")lbStep(-1);
   else if(e.key==="ArrowRight")lbStep(1);
@@ -1362,6 +1738,163 @@ function lbKey(e){
 function closeLightbox(){
   const ov=document.getElementById("lightbox");if(ov)ov.remove();
   document.removeEventListener("keydown",lbKey);LB=null;
+}
+// ---- the review DECK : large image, comment-and-advance, keyboard-first -----
+function setMode(mode){MODE=mode;if(DAY)render();}
+function updateModeButtons(){
+  [["mode-deck","deck"],["mode-grid","grid"],["mode-audit","audit"]].forEach(x=>{
+    const b=document.getElementById(x[0]);if(b)b.className="mini"+(MODE===x[1]?" on":"");
+  });
+}
+function resetDeck(){
+  DECK={frames:[],total:null,sessions:{},order:[],idx:0,offset:0,
+        loading:false,done:false,filter:null,seq:0};
+}
+async function deckLoadPage(){
+  if(DECK.loading||DECK.done)return false;
+  DECK.loading=true;
+  const url=DECK.filter
+    ?"/api/frames?date="+DATE+"&session="+encodeURIComponent(DECK.filter)+"&offset="+DECK.offset+"&limit=96"
+    :"/api/frames?day=1&date="+DATE+"&offset="+DECK.offset+"&limit=96";
+  let j;
+  try{j=await fetch(url).then(r=>r.json());}catch(e){DECK.loading=false;return false;}
+  const frames=j.frames||[];
+  if(j.total!=null)DECK.total=j.total;else if(DECK.total==null)DECK.total=frames.length;
+  if(j.sessions)Object.assign(DECK.sessions,j.sessions);
+  frames.forEach(f=>{
+    if(DECK.filter&&!f.session_id)f.session_id=DECK.filter;
+    if(DECK.order.indexOf(f.session_id)<0)DECK.order.push(f.session_id);
+    DECK.frames.push(f);
+  });
+  DECK.offset+=frames.length;
+  if(!j.has_more||frames.length===0)DECK.done=true;
+  DECK.loading=false;return true;
+}
+async function deckEnsureLoaded(idx){
+  let guard=0;
+  while(idx>=DECK.frames.length&&!DECK.done&&guard<300){await deckLoadPage();guard++;}
+  return idx<DECK.frames.length;
+}
+function renderDeck(m){
+  // seed session meta from the day payload (covers the per-session filter too)
+  (DAY.sessions||[]).forEach(s=>{if(!DECK.sessions[s.id])DECK.sessions[s.id]=
+    {app:s.app,verdict:(s.final&&(s.final.verdict_name||s.final.verdict))||"—",span:s.span};});
+  const deck=el("div","deck");
+  const head=el("div","deckhead");
+  const prog=el("div","prog","frame … / …");head.appendChild(prog);
+  const ctx=el("div","ctx");head.appendChild(ctx);
+  const doneTag=el("div","done","commented ✓");doneTag.style.display="none";head.appendChild(doneTag);
+  const spacer=el("div");spacer.style.flex="1";head.appendChild(spacer);
+  const filt=el("select");filt.appendChild(el("option",null,"all sessions"));
+  (DAY.sessions||[]).forEach(s=>{const o=el("option",null,(s.app||"?")+" · "+(s.span||""));o.value=s.id;filt.appendChild(o);});
+  filt.value=DECK.filter||"";
+  filt.onchange=()=>setDeckFilter(filt.value||null);
+  head.appendChild(filt);
+  deck.appendChild(head);
+  const divider=el("div","deckdivider");divider.style.display="none";deck.appendChild(divider);
+  const stage=el("div","deckstage");
+  const imgwrap=el("div","deckimgwrap");
+  const img=el("img","deckimg");
+  img.onerror=()=>{imgwrap.innerHTML="";imgwrap.appendChild(el("div","ferr","frame image unavailable (rolled out of retention)"));};
+  imgwrap.appendChild(img);stage.appendChild(imgwrap);
+  const side=el("div","deckside");
+  const cbox=el("div","deckcbox");cbox.appendChild(el("h4","","comment this frame — Enter saves & advances"));
+  const existing=el("div","deckexisting");cbox.appendChild(existing);
+  const ta=el("textarea","ct");ta.placeholder="type a note, Enter to save + next · Shift+Enter for newline";
+  cbox.appendChild(ta);
+  const crow=el("div","deckcrow");const saved=el("span","csaved");
+  crow.appendChild(el("span","deckhint","Enter save+next · → skip · ← back · Shift+Enter newline"));
+  crow.appendChild(saved);cbox.appendChild(crow);side.appendChild(cbox);
+  const nav=el("div","decknav");
+  const back=el("button","mini","← back");back.onclick=()=>deckAdvance(-1);
+  const skip=el("button","mini","skip →");skip.onclick=()=>deckAdvance(1);
+  nav.appendChild(back);nav.appendChild(skip);side.appendChild(nav);
+  const ocr=el("details","deckocr");ocr.appendChild(el("summary",null,"OCR text on this frame"));
+  const ocrText=el("div","ocrtext","…");ocr.appendChild(ocrText);side.appendChild(ocr);
+  stage.appendChild(side);deck.appendChild(stage);m.appendChild(deck);
+  DECK.dom={prog,ctx,doneTag,divider,img,imgwrap,existing,ta,saved,ocrText,filt};
+  ta.addEventListener("keydown",(e)=>{
+    if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();deckSave();}
+  });
+  deckEnsureLoaded(DECK.idx).then(()=>deckShow());
+}
+function deckShow(){
+  const dom=DECK.dom;if(!dom)return;
+  const f=DECK.frames[DECK.idx];
+  if(!f){dom.prog.textContent="no frames captured for this day";dom.ctx.textContent="";return;}
+  const myseq=(++DECK.seq);
+  if(!dom.imgwrap.contains(dom.img)){dom.imgwrap.innerHTML="";dom.imgwrap.appendChild(dom.img);}
+  dom.img.classList.add("loading");
+  dom.img.onload=()=>dom.img.classList.remove("loading");
+  dom.img.src="/frame/"+f.frame_id+".jpg?full=1";
+  const total=DECK.total!=null?DECK.total:DECK.frames.length;
+  const sidx=DECK.order.indexOf(f.session_id);
+  const meta=DECK.sessions[f.session_id]||{};
+  dom.prog.textContent="frame "+(DECK.idx+1)+" / "+total+" · session "+(sidx+1)+"/"+(DECK.order.length||1);
+  dom.ctx.innerHTML="";
+  dom.ctx.appendChild(el("span",null,f.ts||""));
+  dom.ctx.appendChild(el("b",null,"  "+(meta.app||"?")));
+  dom.ctx.appendChild(el("span",null," "+(meta.span||"")+"  "));
+  dom.ctx.appendChild(el("span","v",meta.verdict||"—"));
+  const prev=DECK.idx>0?DECK.frames[DECK.idx-1]:null;
+  if(!prev||prev.session_id!==f.session_id){
+    dom.divider.style.display="";dom.divider.innerHTML="";
+    dom.divider.appendChild(document.createTextNode("— "+(f.ts||"")+"  "));
+    dom.divider.appendChild(el("b",null,meta.app||"?"));
+    dom.divider.appendChild(document.createTextNode(" · "+(meta.verdict||"—")+" —"));
+  }else{dom.divider.style.display="none";}
+  const notes=fbForFrame(f.frame_id);
+  dom.existing.innerHTML="";notes.forEach(n=>dom.existing.appendChild(renderNote(n)));
+  dom.doneTag.style.display=((f.comments||0)>0||notes.length)?"":"none";
+  dom.saved.textContent="";dom.ta.value="";dom.ta.focus();
+  dom.ocrText.textContent="loading…";
+  fetch("/api/frame?date="+DATE+"&id="+f.frame_id).then(r=>r.json()).then(j=>{
+    if(myseq!==DECK.seq)return;
+    dom.ocrText.textContent=(j&&j.ocr_snippet&&j.ocr_snippet.trim())?j.ocr_snippet:"(no OCR text captured for this frame)";
+  }).catch(()=>{if(myseq===DECK.seq)dom.ocrText.textContent="(OCR unavailable)";});
+  deckPreload();
+}
+function deckPreload(){
+  for(let k=1;k<=3;k++){const nf=DECK.frames[DECK.idx+k];if(nf){const im=new Image();im.src="/frame/"+nf.frame_id+".jpg?full=1";}}
+  if(DECK.idx+4>=DECK.frames.length&&!DECK.done)deckLoadPage();
+}
+async function deckAdvance(n){
+  const target=DECK.idx+n;
+  if(target<0)return;
+  const ok=await deckEnsureLoaded(target);
+  if(!ok){if(DECK.dom)DECK.dom.saved.textContent="✓ end of the day — "+DECK.frames.length+" frames reviewed";return;}
+  DECK.idx=target;deckShow();
+}
+async function deckSave(){
+  const dom=DECK.dom;if(!dom)return;
+  const f=DECK.frames[DECK.idx];if(!f)return;
+  const text=dom.ta.value.trim();
+  if(!text){deckAdvance(1);return;}   // empty Enter = skip forward
+  dom.saved.textContent="…";
+  try{
+    await postComment({date:DATE,kind:"frame",frame_id:f.frame_id,session_id:f.session_id||null,comment:text});
+    f.comments=(f.comments||0)+1;dom.ta.value="";
+    deckAdvance(1);
+  }catch(err){dom.saved.textContent="✕ "+err.message;}
+}
+function setDeckFilter(sid){
+  DECK.filter=sid;DECK.frames=[];DECK.order=[];DECK.offset=0;DECK.total=null;DECK.done=false;DECK.loading=false;DECK.idx=0;
+  render();
+}
+async function jumpDeck(fid){
+  MODE="deck";
+  if(DECK.filter!==null){DECK.filter=null;DECK.frames=[];DECK.order=[];DECK.offset=0;DECK.total=null;DECK.done=false;DECK.loading=false;}
+  let guard=0,pos=DECK.frames.findIndex(f=>Number(f.frame_id)===Number(fid));
+  while(pos<0&&!DECK.done&&guard<400){await deckLoadPage();guard++;pos=DECK.frames.findIndex(f=>Number(f.frame_id)===Number(fid));}
+  DECK.idx=pos>=0?pos:0;
+  render();
+}
+function deckKey(e){
+  if(MODE!=="deck"||!DECK.dom)return;
+  const ta=DECK.dom.ta;
+  const typing=ta&&document.activeElement===ta&&ta.value.trim().length>0;
+  if(e.key==="ArrowRight"&&!typing){e.preventDefault();deckAdvance(1);}
+  else if(e.key==="ArrowLeft"&&!typing){e.preventDefault();deckAdvance(-1);}
 }
 async function doLabel(sid,verdict){
   const flash=document.getElementById("flash-"+sid);
@@ -1379,6 +1912,10 @@ async function doLabel(sid,verdict){
   const t=el("div","note");t.textContent="labeled "+sid.slice(0,8)+" → "+verdict+"  (score "+(before==null?"—":before)+" → "+(after==null?"—":after)+")";
   mb.appendChild(t);setTimeout(()=>t.remove(),4000);
 }
+const _md=document.getElementById("mode-deck");if(_md)_md.onclick=()=>setMode("deck");
+const _mg=document.getElementById("mode-grid");if(_mg)_mg.onclick=()=>setMode("grid");
+const _ma=document.getElementById("mode-audit");if(_ma)_ma.onclick=()=>setMode("audit");
+document.addEventListener("keydown",deckKey);
 loadDates().then(load);
 </script>
 </body></html>

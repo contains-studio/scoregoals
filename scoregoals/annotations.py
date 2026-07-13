@@ -13,14 +13,29 @@ Entry shape (one JSON object per line)::
     {
       "ts": "2026-07-12T18:40:00-07:00",   # when the comment was filed (local ISO)
       "date": "2026-07-12",                # the day the comment is ABOUT
-      "kind": "session" | "day" | "idea",  # what it annotates
-      "session_id": "6c66c14da1ef",        # present for kind=session
-      "context": {                          # server-enriched, present for kind=session
+      "kind": "session" | "day" | "idea" | "frame",  # what it annotates
+      "session_id": "6c66c14da1ef",        # present for kind=session and kind=frame
+      "context": {                          # server-enriched, present for session/frame
         "app": "Claude", "title": "...", "span": "07:31-07:35",
         "minutes": 3.8, "verdict": "deep-work-coding", "source": "keyword"
       },
       "comment": "this was actually research, not coding",
       "status": "new" | "acked"
+    }
+
+A ``kind=frame`` entry is a comment on ONE specific screenshot. It carries the
+extra keys ``frame_id`` (screenpipe's int frame id), ``frame_ts`` ("HH:MM:SS"),
+the owning ``session_id``, and its ``context`` adds ``ocr_snippet`` (the first
+~200 chars of that frame's redacted OCR text) so the agent has the exact visual
+context::
+
+    {
+      "ts": "...", "date": "2026-07-12", "kind": "frame",
+      "frame_id": 4821, "frame_ts": "08:14:53", "session_id": "db3a0d0ed69d",
+      "context": {"app": "Claude", "title": "...", "span": "07:53-10:34",
+        "verdict": "deep-work-coding", "source": "keyword",
+        "ocr_snippet": "..."},
+      "comment": "this exact screen is the bug", "status": "new"
     }
 
 This module is stdlib-only and never raises on a normal call — a missing or
@@ -35,7 +50,7 @@ from pathlib import Path
 
 from .config import Config
 
-KINDS = ("session", "day", "idea")
+KINDS = ("session", "day", "idea", "frame")
 
 
 def _store_path(cfg: Config) -> Path:
@@ -110,21 +125,104 @@ def enrich_context(cfg: Config, date: str, session_id: str) -> dict | None:
     return None
 
 
+def enrich_frame_context(
+    cfg: Config, date: str, frame_id: int, session_id: str | None = None
+) -> dict | None:
+    """Resolve everything a frame comment stores beyond the raw text:
+    ``{frame_ts, session_id, context}`` where ``context`` is
+    ``{app, title, span, verdict, source, ocr_snippet}``.
+
+    The frame's local timestamp + OCR snippet come from screenpipe's db (via
+    ``audit.frame_ocr``); the owning session is the one passed in, or — failing
+    that — the session whose UTC span contains the frame. Returns None only if
+    the audit module can't be imported (still a valid comment: it just carries
+    less context)."""
+    try:
+        from . import audit as audit_mod
+    except Exception:
+        return None
+
+    fo = audit_mod.frame_ocr(cfg, frame_id) or {}
+    frame_ts = fo.get("frame_ts")
+    ocr_snippet = fo.get("ocr_snippet") or ""
+    futc = fo.get("utc")
+
+    try:
+        day = audit_mod.build_day(cfg, date)
+    except Exception:
+        day = {"sessions": []}
+    sessions = day.get("sessions", [])
+
+    sess = None
+    if session_id:
+        for s in sessions:
+            sid = str(s.get("id") or "")
+            if sid == session_id or sid.startswith(session_id) or session_id.startswith(sid):
+                sess = s
+                break
+    if sess is None and futc:
+        for s in sessions:
+            lo = audit_mod._local_to_utc(s.get("start"))
+            hi = audit_mod._local_to_utc(s.get("end") or s.get("start"))
+            if lo and hi and lo <= futc <= hi + "~":
+                sess = s
+                break
+
+    if sess is not None:
+        final = sess.get("final") or {}
+        context = {
+            "app": sess.get("app"),
+            "title": sess.get("title"),
+            "span": sess.get("span"),
+            "verdict": final.get("verdict_name") or final.get("verdict"),
+            "source": final.get("source"),
+            "ocr_snippet": ocr_snippet,
+        }
+        resolved_sid = str(sess.get("id") or "") or session_id
+    else:
+        context = {"ocr_snippet": ocr_snippet}
+        resolved_sid = session_id
+
+    return {"frame_ts": frame_ts, "session_id": resolved_sid, "context": context}
+
+
+def frame_comment_counts(cfg: Config, date: str) -> dict[int, int]:
+    """Per-frame comment counts for a day: ``{frame_id: count}`` over all stored
+    frame comments (new + acked), so the audit grid can render 💬 badges in one
+    pass instead of an N+1 lookup per thumbnail."""
+    out: dict[int, int] = {}
+    for e in _read_all(cfg):
+        if e.get("kind") != "frame" or str(e.get("date")) != date:
+            continue
+        fid = e.get("frame_id")
+        if fid is None:
+            continue
+        try:
+            key = int(fid)
+        except (TypeError, ValueError):
+            continue
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
 def append_comment(
     cfg: Config,
     date: str,
     kind: str,
     comment: str,
     session_id: str | None = None,
+    frame_id: int | None = None,
     context: dict | None = None,
     enrich: bool = True,
 ) -> dict:
     """Append one comment to the feedback store and return the stored entry.
 
-    ``kind`` is one of session|day|idea (anything else is coerced to "idea").
-    For a session comment, ``context`` is auto-enriched from the day data unless
-    a context dict is passed or ``enrich=False``. Raises ValueError only on an
-    empty comment — an agent-facing store should never carry blank entries."""
+    ``kind`` is one of session|day|idea|frame (anything else is coerced to
+    "idea"). For a ``session`` comment, ``context`` is auto-enriched from the day
+    data; for a ``frame`` comment, ``frame_ts`` + ``session_id`` + a context that
+    includes ``ocr_snippet`` are auto-enriched — unless a context dict is passed
+    or ``enrich=False``. Raises ValueError only on an empty comment — an
+    agent-facing store should never carry blank entries."""
     text = (comment or "").strip()
     if not text:
         raise ValueError("comment is empty")
@@ -138,6 +236,24 @@ def append_comment(
         )
         if ctx:
             entry["context"] = ctx
+    elif k == "frame" and frame_id is not None:
+        entry["frame_id"] = int(frame_id)
+        fe = None
+        if context is None and enrich:
+            fe = enrich_frame_context(cfg, date, int(frame_id), session_id=session_id)
+        if fe:
+            if fe.get("frame_ts"):
+                entry["frame_ts"] = fe["frame_ts"]
+            sid = fe.get("session_id") or session_id
+            if sid:
+                entry["session_id"] = str(sid)
+            if fe.get("context"):
+                entry["context"] = fe["context"]
+        else:
+            if session_id:
+                entry["session_id"] = str(session_id)
+            if context:
+                entry["context"] = context
     entry["comment"] = text
     entry["status"] = "new"
 

@@ -409,14 +409,25 @@ human debugging surface, not a machine API, but its JSON endpoints are stable:
   (verdict/source/confidence/needs_review) and `chain` (`label`, `rule`,
   `keyword.hits`, `llm`, `system_noise`), plus `goals[]`, `projects[]`,
   `archived_label_warnings[]`, `intentions`, `label_counts`, `resolution_counts`.
-- `GET /api/frames?session=ID` — up to 8 evenly-spaced **real** frame thumbnails
-  for a session's span. Reads screenpipe's own sqlite (`~/.screenpipe/db.sqlite`,
-  opened read-only) to find `frames` rows inside the session's UTC span, keeps
-  only those whose backing file still exists (rolling retention), and returns
-  `frames: [{frame_id, ts}]` with `frames_available`. The redacted OCR text
-  timeline is always included below as text evidence and is the honest fallback
-  when no frame resolves (db missing / retention gap) — the page never fabricates
-  an image.
+- `GET /api/frames?session=ID[&offset=0&limit=48]` — a **paged** view of **every**
+  real frame in a session's span (no longer an 8-sample). Reads screenpipe's own
+  sqlite (`~/.screenpipe/db.sqlite`, opened read-only) to find the `frames` rows
+  inside the session's UTC span, keeps only those whose backing file still exists
+  (rolling retention), de-dupes consecutive identical captures, and returns
+  `frames: [{frame_id, ts, comments}]` sliced to `[offset:offset+limit]` plus
+  `total`, `offset`, `limit`, `has_more`, `frames_available`. `comments` is that
+  frame's per-frame comment count (so 💬 badges render without an N+1). The
+  redacted OCR text timeline rides on the **first page only** (`offset=0`) as text
+  evidence and the honest fallback when no frame resolves — the page never
+  fabricates an image.
+- `GET /api/frames?day=1[&offset=0&limit=48]` — the same paging, but one
+  continuous **chronological grid of the whole day** across sessions. Each frame
+  carries its owning `session_id` + `comments`; a `sessions` map gives each
+  session's `{app, verdict, span}` for the grid's section headers. Drives the
+  day-level "🖼 Grid" view and the "🎞 Deck" review walk.
+- `GET /api/frame?id=FID` — one frame's `{frame_id, frame_ts, ocr_snippet}` (a
+  longer redacted OCR read of that frame's `full_text`), for the deck's on-screen
+  OCR panel.
 - `GET /frame/<id>.jpg[?full=1]` — extracts that exact frame as JPEG with ffmpeg:
   a chunk-backed frame via `select=eq(n,offset_index)` (offset_index is the
   frame's index within its `.mp4` chunk), or an event-driven `snapshot_path` jpg
@@ -429,11 +440,12 @@ human debugging surface, not a machine API, but its JSON endpoints are stable:
   exact `scoregoals label` path (append label → re-mine rules → rescore) and
   returns the fresh day payload. Localhost-only; non-loopback clients are
   rejected.
-- `POST /api/comment {date, kind, session_id?, comment}` — files a structured
-  feedback note (see [`feedback`](#feedback-the-human--agent-channel)). The
-  server enriches a `kind: "session"` note with the session's
-  `{app, title, span, minutes, verdict, source}` from the day data, then appends
-  to `data/feedback/feedback.jsonl`. Returns `{ok: true, entry: {...}}`.
+- `POST /api/comment {date, kind, session_id?, frame_id?, comment}` — files a
+  structured feedback note (see [`feedback`](#feedback-the-human--agent-channel)).
+  The server enriches a `kind: "session"` note with the session's
+  `{app, title, span, minutes, verdict, source}`, and a `kind: "frame"` note with
+  that frame's `frame_ts` + `ocr_snippet` and the owning session's context, then
+  appends to `data/feedback/feedback.jsonl`. Returns `{ok: true, entry: {...}}`.
 - `GET /api/feedback[?date=D&status=new]` — the same aggregation
   `scoregoals feedback --json` returns (see below), for the page's own
   "N notes for Claude" drawer.
@@ -483,11 +495,42 @@ are **newest first**.
 |------|------|------|
 | `ts` | string (local ISO) | when the note was filed |
 | `date` | string `YYYY-MM-DD` | the day the note is *about* |
-| `kind` | string | `session` \| `day` \| `idea` |
-| `session_id` | string | present for `kind: session` |
-| `context` | object | present for `kind: session` — server-enriched `{app, title, span, minutes, verdict, source}` at the time the note was filed |
+| `kind` | string | `session` \| `day` \| `idea` \| `frame` |
+| `session_id` | string | present for `kind: session` and `kind: frame` |
+| `frame_id` | int | present for `kind: frame` — screenpipe's frame id |
+| `frame_ts` | string `HH:MM:SS` | present for `kind: frame` — the frame's local time |
+| `context` | object | present for `kind: session` (`{app, title, span, minutes, verdict, source}`) and `kind: frame` (`{app, title, span, verdict, source, ocr_snippet}`) — server-enriched at the time the note was filed |
 | `comment` | string | the user's verbatim text |
 | `status` | string | `new` (unprocessed) \| `acked` (processed) |
+
+**Frame notes are first-class feedback.** When Michael reviews his day in the
+audit page's image **deck** (or lightbox), he comments on **specific
+screenshots**: each such note is a `kind: "frame"` entry whose `frame_id` +
+`context.ocr_snippet` give the agent the exact visual context — the literal
+screen the comment is about, plus the first ~200 chars of that frame's OCR text —
+so "this exact screen is the bug" is actionable without guessing which moment he
+meant. `GET /api/feedback` and `scoregoals feedback --json` pass every `frame`
+field through unchanged.
+
+**Real frame note** (filed from the deck, read back via `feedback --json`):
+
+```json
+{
+  "ts": "2026-07-12T21:05:00-07:00",
+  "date": "2026-07-12",
+  "kind": "frame",
+  "frame_id": 4821,
+  "frame_ts": "08:14:53",
+  "session_id": "db3a0d0ed69d",
+  "context": {
+    "app": "Claude", "title": null, "span": "07:53-10:34",
+    "verdict": "deep-work-coding", "source": "keyword",
+    "ocr_snippet": "audit.py build_frames extract_frame ..."
+  },
+  "comment": "this exact screen is where the paging bug shows",
+  "status": "new"
+}
+```
 
 **Real round-trip** (a session note filed from the audit page, then read back):
 
