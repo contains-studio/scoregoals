@@ -15,22 +15,34 @@ Design constraints (HARD):
 * bound to 127.0.0.1; non-loopback clients are rejected even so.
 * no auth — this is a single-user LOCAL debugging tool. It never writes anything
   except through the exact ``record_label`` + rescore + mine path the CLI uses.
-* frames: screenpipe 0.4.25 stores frames inside rolling .mp4 chunks, not as
-  per-frame image files, and exposes them (if at all) only via its running HTTP
-  server. ``/api/frames`` PROBES for a live image route at request time and
-  proxies it via ``/frame/<id>`` when present; otherwise it falls back — HONESTLY
-  — to the per-session OCR text timeline with a note. It never fakes an image.
+* frames: screenpipe 0.4.25 keeps frames inside rolling .mp4 chunks (and, for
+  newer event-driven captures, a direct snapshot .jpg) and does NOT expose a
+  frame-image HTTP route. So ``/api/frames`` reads screenpipe's OWN sqlite
+  (``~/.screenpipe/db.sqlite``, opened read-only) to find the ``frames`` rows in a
+  session's UTC span, and ``/frame/<id>.jpg`` extracts that exact frame with
+  ffmpeg — a chunk frame at ``select=eq(n,offset_index)`` (offset_index is the
+  frame's index within its chunk; validated empirically against the row's OCR),
+  or the snapshot jpg directly. Extractions cache to ``data/frame_cache`` (~500MB
+  LRU cap). When a frame's chunk has rolled out of retention it is skipped; if
+  none resolve, ``/api/frames`` falls back — HONESTLY — to the per-session OCR
+  text timeline with a note. It never fakes an image. Frames are RAW screen
+  pixels, served only on 127.0.0.1 — this is the point of a local audit page.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import webbrowser
 from datetime import date as _date
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .config import Config
@@ -315,54 +327,96 @@ def available_dates(cfg: Config) -> list[str]:
     return sorted(set(dates), reverse=True)
 
 
-# --- frames: probe for a live image route, else honest OCR fallback ---------
+# --- frames: extract REAL screenshots from screenpipe's local video store ----
+#
+# screenpipe 0.4.25 has no frame-image HTTP route. It DOES keep a sqlite index
+# (~/.screenpipe/db.sqlite) whose ``frames`` rows point into rolling ``.mp4``
+# chunks: frames(id, video_chunk_id, offset_index, timestamp, snapshot_path, …),
+# video_chunks(id, file_path, fps, …). offset_index is the frame's index WITHIN
+# its chunk video — validated empirically (a chunk's max offset_index +1 equals
+# ffprobe's frame count, and extracting select=eq(n,offset_index) yields an image
+# whose content matches that row's OCR full_text). Newer event-driven captures
+# instead carry a direct ``snapshot_path`` jpg. We read that db READ-ONLY and
+# extract single frames with ffmpeg, caching the jpegs under data/frame_cache.
+
+_SP_DB = Path.home() / ".screenpipe" / "db.sqlite"
+_FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+_CACHE_CAP_BYTES = 500 * 1024 * 1024   # ~500MB LRU cap on the extracted-frame cache
+_FRAME_MAX = 8                          # thumbnails per session strip
+_THUMB_W = 960                          # max thumbnail width (px)
 
 
-def _screenpipe_frame_probe(cfg: Config) -> tuple[bool, str, str | None]:
-    """Probe whether the RUNNING screenpipe exposes a frame-image route.
+def _sp_connect():
+    """Open screenpipe's sqlite READ-ONLY. screenpipe writes to it constantly, so
+    use ``mode=ro`` + a short busy timeout and never hold the handle open."""
+    import sqlite3
 
-    Returns (available, note, route_template). Tries a few known shapes against a
-    live server with the Bearer token. On 0.4.25 with the server down (or with no
-    image route) this returns (False, <honest note>, None) — the caller then
-    shows the OCR text timeline instead.
-    """
-    import urllib.error
-    import urllib.request
+    if not _SP_DB.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{_SP_DB}?mode=ro", uri=True, timeout=2.0)
+        conn.execute("PRAGMA busy_timeout=2000")
+        return conn
+    except Exception:
+        return None
 
-    from .sources.screenpipe import _resolve_token
 
-    base = cfg.screenpipe_url.rstrip("/")
-    token = _resolve_token(cfg)
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    # Candidate routes seen across screenpipe versions; {id} filled per request.
-    candidates = ["/frames/{id}", "/experimental/frames/{id}", "/frame/{id}"]
-    for tmpl in candidates:
-        url = base + tmpl.format(id="1")
+def _local_to_utc(naive_local) -> str | None:
+    """Timeline sessions store NAIVE LOCAL timestamps ('2026-07-12T07:53:44');
+    screenpipe stores UTC. Convert (assuming the system timezone) and return a
+    lexically-comparable 'YYYY-MM-DDTHH:MM:SS' UTC string."""
+    try:
+        dt = datetime.fromisoformat(str(naive_local))
+    except Exception:
+        return None
+    # astimezone() presumes local for a naive dt, then we normalise to UTC.
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _utc_to_local_hm(utc_ts) -> str:
+    """screenpipe UTC ts -> local 'HH:MM', to match the session span display."""
+    try:
+        dt = datetime.fromisoformat(str(utc_ts))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%H:%M")
+    except Exception:
+        return _iso_hm(utc_ts)
+
+
+def _even_pick(items: list, k: int) -> list:
+    """Up to k items evenly spaced across the list (endpoints included)."""
+    n = len(items)
+    if n <= k:
+        return list(items)
+    return [items[round(i * (n - 1) / (k - 1))] for i in range(k)]
+
+
+def _prune_cache(cache_dir: Path, cap_bytes: int = _CACHE_CAP_BYTES) -> None:
+    """Keep the frame cache under cap_bytes by deleting oldest files first."""
+    try:
+        files = [(p.stat().st_mtime, p.stat().st_size, p) for p in cache_dir.glob("*.jpg")]
+    except Exception:
+        return
+    total = sum(sz for _, sz, _ in files)
+    if total <= cap_bytes:
+        return
+    for _mtime, sz, p in sorted(files):     # oldest mtime first
+        if total <= cap_bytes:
+            break
         try:
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=2.0) as resp:  # noqa: S310 localhost
-                ctype = resp.headers.get("Content-Type", "")
-                if resp.status == 200 and ctype.startswith("image/"):
-                    return True, f"screenpipe exposes frame images at {tmpl}", tmpl
-        except urllib.error.HTTPError as exc:
-            # 404/400 = route not this shape; 401 = auth; keep trying others.
-            if exc.code in (401, 403):
-                return False, "screenpipe rejected auth for frame probe", None
+            p.unlink()
+            total -= sz
         except Exception:
-            continue
-    return (
-        False,
-        "this screenpipe build (0.4.25) doesn't expose frame images over HTTP — "
-        "frames live inside rolling .mp4 chunks in ~/.screenpipe/data. Showing the "
-        "OCR text timeline for this session's span instead.",
-        None,
-    )
+            pass
 
 
 def build_frames(cfg: Config, date: str, session_id: str) -> dict:
-    """Frame references for a session's span. Probes screenpipe for a live image
-    route; when none exists, returns the redacted OCR text timeline (honest
-    fallback — never a fabricated image)."""
+    """Real frame thumbnails for a session's span, read from screenpipe's own
+    sqlite. Picks up to 8 evenly-spaced frames whose backing file still exists
+    (rolling retention); returns ``frames: [{frame_id, ts}]``. The redacted OCR
+    text timeline is ALWAYS included below as the text evidence, and becomes the
+    honest fallback when no frames resolve (db missing / retention gap)."""
     from .aggregate.redact import redact_text
     from .labels import session_id_for
     from .store import load_timeline
@@ -375,10 +429,54 @@ def build_frames(cfg: Config, date: str, session_id: str) -> dict:
                 session = s
                 break
     if session is None:
-        return {"session": session_id, "error": "session not found", "frames_available": False,
-                "ocr_timeline": []}
+        return {"session": session_id, "error": "session not found",
+                "frames_available": False, "frames": [], "ocr_timeline": []}
 
-    available, note, tmpl = _screenpipe_frame_probe(cfg)
+    frames_out: list[dict] = []
+    note = ""
+    lo = _local_to_utc(session.start)
+    hi = _local_to_utc(session.end or session.start)
+    conn = _sp_connect()
+    if conn is None:
+        note = ("screenpipe db not found at ~/.screenpipe/db.sqlite — "
+                "showing the OCR text timeline instead.")
+    elif not (lo and hi):
+        conn.close()
+        note = "could not resolve the session's time span — showing the OCR timeline."
+    else:
+        rows: list = []
+        try:
+            # '~' > any digit/'.'/'+', so 'HH:MM:SS~' is an inclusive upper bound
+            # over screenpipe's fractional+offset timestamps within that second.
+            rows = conn.execute(
+                "SELECT f.id, f.timestamp, f.snapshot_path, vc.file_path "
+                "FROM frames f LEFT JOIN video_chunks vc ON vc.id = f.video_chunk_id "
+                "WHERE f.timestamp >= ? AND f.timestamp <= ? "
+                "  AND (f.video_chunk_id IS NOT NULL OR f.snapshot_path IS NOT NULL) "
+                "ORDER BY f.timestamp",
+                (lo, hi + "~"),
+            ).fetchall()
+        except Exception as exc:
+            note = f"screenpipe db query failed ({exc}) — showing the OCR timeline."
+        finally:
+            conn.close()
+        # Keep only frames whose backing file still exists (rolling retention).
+        resolvable = []
+        for fid, ts, snap, chunk_path in rows:
+            path = snap if snap else chunk_path
+            if path and os.path.exists(path):
+                resolvable.append((fid, ts))
+        picked = _even_pick(resolvable, _FRAME_MAX)
+        frames_out = [{"frame_id": fid, "ts": _utc_to_local_hm(ts)} for fid, ts in picked]
+        if frames_out:
+            note = (f"{len(frames_out)} of {len(resolvable)} available frames from "
+                    f"screenpipe's local video store ({len(rows)} indexed for this span).")
+        elif rows and not resolvable:
+            note = (f"all {len(rows)} frames for this span have rolled out of "
+                    "screenpipe's retention window — showing the OCR text timeline.")
+        elif not rows:
+            note = ("no screenpipe frames indexed for this span — "
+                    "showing the OCR text timeline.")
 
     ocr_timeline: list[dict] = []
     # Try live screenpipe OCR for the span; on any failure fall back to the
@@ -407,38 +505,85 @@ def build_frames(cfg: Config, date: str, session_id: str) -> dict:
         "session": session_id,
         "span": _span(session.start, session.end),
         "app": session.app,
-        "frames_available": available,
-        "frame_route": tmpl,
+        "frames_available": bool(frames_out),
+        "frames": frames_out,
         "note": note,
         "ocr_timeline": ocr_timeline[:60],
     }
 
 
-def proxy_frame(cfg: Config, frame_id: str) -> tuple[int, str, bytes]:
-    """Fetch one frame image from a live screenpipe, adding auth server-side.
-    Returns (status, content_type, body). Only used when the probe found a route.
-    """
-    import urllib.error
-    import urllib.request
+def extract_frame(cfg: Config, frame_id: str, full: bool = False) -> tuple[int, str, bytes]:
+    """Extract ONE frame as JPEG from screenpipe's local store; cache the result.
 
-    from .sources.screenpipe import _resolve_token
-
-    available, _note, tmpl = _screenpipe_frame_probe(cfg)
-    if not available or not tmpl:
-        return 404, "application/json", json.dumps(
-            {"error": "no frame image route on this screenpipe build"}).encode()
-    base = cfg.screenpipe_url.rstrip("/")
-    token = _resolve_token(cfg)
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    url = base + tmpl.format(id=frame_id)
+    Returns (status, content_type, body). A chunk-backed frame is extracted with
+    ``ffmpeg -vf select=eq(n,offset_index)`` (thumbnail: also scaled to
+    ``_THUMB_W``; ``full=True``: original size). An event-driven ``snapshot_path``
+    jpg is scaled for the thumbnail or served as-is when full. Extractions cache
+    to ``data/frame_cache/<id>[_full].jpg`` (gitignored, ~500MB LRU). 404 (tiny
+    JSON) when the frame is unknown or its chunk rolled out of retention."""
     try:
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=5.0) as resp:  # noqa: S310 localhost
-            return int(resp.status), resp.headers.get("Content-Type", "image/png"), resp.read()
-    except urllib.error.HTTPError as exc:
-        return int(exc.code), "application/json", json.dumps({"error": f"screenpipe {exc.code}"}).encode()
+        fid = int(str(frame_id).strip())
+    except Exception:
+        return 400, "application/json", json.dumps({"error": "bad frame id"}).encode()
+
+    cache_dir = Path(cfg.data_dir) / "frame_cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    cache_file = cache_dir / f"{fid}{'_full' if full else ''}.jpg"
+    if cache_file.exists() and cache_file.stat().st_size > 0:
+        return 200, "image/jpeg", cache_file.read_bytes()   # CACHE HIT
+
+    conn = _sp_connect()
+    if conn is None:
+        return 404, "application/json", json.dumps({"error": "screenpipe db unavailable"}).encode()
+    try:
+        row = conn.execute(
+            "SELECT f.offset_index, f.snapshot_path, vc.file_path "
+            "FROM frames f LEFT JOIN video_chunks vc ON vc.id = f.video_chunk_id "
+            "WHERE f.id = ?", (fid,)).fetchone()
     except Exception as exc:
-        return 502, "application/json", json.dumps({"error": str(exc)}).encode()
+        return 404, "application/json", json.dumps({"error": f"db query failed: {exc}"}).encode()
+    finally:
+        conn.close()
+    if not row:
+        return 404, "application/json", json.dumps({"error": "frame not found"}).encode()
+
+    offset, snapshot_path, chunk_path = row
+    scale = f"scale='min({_THUMB_W},iw)':-2"
+
+    if snapshot_path and os.path.exists(snapshot_path):
+        if full:
+            # Already a jpg — serve it directly (and cache a copy).
+            try:
+                data = Path(snapshot_path).read_bytes()
+                cache_file.write_bytes(data)
+                _prune_cache(cache_dir)
+                return 200, "image/jpeg", data
+            except Exception as exc:
+                return 404, "application/json", json.dumps({"error": str(exc)}).encode()
+        src, vf = snapshot_path, scale
+    elif chunk_path and os.path.exists(chunk_path):
+        sel = f"select=eq(n\\,{int(offset or 0)})"
+        src, vf = chunk_path, (sel if full else f"{sel},{scale}")
+    else:
+        return 404, "application/json", json.dumps(
+            {"error": "frame's video chunk rolled out of retention"}).encode()
+
+    cmd = [_FFMPEG, "-nostdin", "-v", "error", "-i", src]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += ["-frames:v", "1", "-q:v", "4", str(cache_file), "-y"]
+    try:
+        subprocess.run(cmd, timeout=10, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        return 404, "application/json", json.dumps({"error": f"ffmpeg failed: {exc}"}).encode()
+    if not (cache_file.exists() and cache_file.stat().st_size > 0):
+        return 404, "application/json", json.dumps({"error": "extraction produced no image"}).encode()
+    _prune_cache(cache_dir)
+    return 200, "image/jpeg", cache_file.read_bytes()
 
 
 # --- label write (same path as cmd_label) -----------------------------------
@@ -548,10 +693,16 @@ def _make_handler(cfg: Config):
                     self._json(build_frames(cfg, d, sess))
                 elif path.startswith("/frame/"):
                     fid = path[len("/frame/"):]
-                    status, ctype, body = proxy_frame(cfg, fid)
+                    if fid.endswith(".jpg"):
+                        fid = fid[:-4]
+                    full = (qs.get("full") or ["0"])[0] in ("1", "true", "yes")
+                    status, ctype, body = extract_frame(cfg, fid, full=full)
                     self.send_response(status)
                     self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(body)))
+                    if status == 200 and ctype.startswith("image/"):
+                        # local perf: frames are immutable once extracted.
+                        self.send_header("Cache-Control", "private, max-age=3600")
                     self.end_headers()
                     self.wfile.write(body)
                 else:
@@ -687,6 +838,36 @@ PAGE_HTML = r"""<!doctype html>
   .note{color:var(--amber);font-size:12px;margin:4px 0}
   .arch{color:var(--red)}
   .empty{color:var(--muted);padding:40px;text-align:center}
+  /* real-frame thumbnail strip + lightbox */
+  .fstrip{display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px}
+  .fthumb{position:relative;flex:0 0 auto;width:150px;height:97px;border:1px solid var(--line);
+    border-radius:8px;overflow:hidden;cursor:pointer;background:var(--chip);
+    display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px}
+  .fthumb:hover{border-color:var(--mint2)}
+  .fthumb img{width:100%;height:100%;object-fit:cover;display:block}
+  .fthumb.ferr{color:var(--red);font-size:20px;cursor:default}
+  .fskel{width:150px;height:97px;border-radius:8px;flex:0 0 auto;
+    background:linear-gradient(100deg,var(--chip) 30%,var(--navy2) 50%,var(--chip) 70%);
+    background-size:200% 100%;animation:shimmer 1.2s linear infinite}
+  @keyframes shimmer{to{background-position:-200% 0}}
+  .fcap{position:absolute;left:0;bottom:0;background:rgba(11,18,32,.78);color:var(--mint);
+    font:11px ui-monospace,Menlo,monospace;padding:1px 6px;border-top-right-radius:6px}
+  .ftimeline{margin-top:4px}
+  .lightbox{position:fixed;inset:0;z-index:50;background:rgba(6,10,18,.93);
+    display:flex;align-items:center;justify-content:center}
+  .lbimg{max-width:92vw;max-height:82vh;border:1px solid var(--line);border-radius:8px;
+    box-shadow:0 20px 60px rgba(0,0,0,.6);background:var(--navy2)}
+  .lbcap{position:fixed;bottom:16px;left:0;right:0;text-align:center;color:var(--ink);
+    font:12.5px ui-monospace,Menlo,monospace}
+  .lbnav,.lbclose{position:fixed;background:var(--panel);color:var(--ink);border:1px solid var(--line);
+    border-radius:10px;cursor:pointer;line-height:1;padding:8px 15px;font-size:24px}
+  .lbnav:hover,.lbclose:hover{border-color:var(--mint2);color:var(--mint)}
+  .lbprev{left:18px;top:50%;transform:translateY(-50%)}
+  .lbnext{right:18px;top:50%;transform:translateY(-50%)}
+  .lbclose{top:16px;right:18px;font-size:16px}
+  footer{color:var(--muted);font-size:11.5px;text-align:center;padding:26px 20px 34px;
+    max-width:1180px;margin:0 auto;border-top:1px solid var(--line)}
+  footer .warn{color:var(--amber)}
 </style>
 </head><body>
 <header>
@@ -698,6 +879,9 @@ PAGE_HTML = r"""<!doctype html>
   </div>
 </header>
 <main id="main"><div class="empty">loading…</div></main>
+<footer>
+  the evidence room · 127.0.0.1 only · <span class="warn">frames are raw, unredacted screen pixels — local-only, never uploaded</span>
+</footer>
 <script>
 const qs=new URLSearchParams(location.search);
 let DATE=qs.get("date")||new Date().toISOString().slice(0,10);
@@ -882,16 +1066,76 @@ function llmBody(l){
 async function showFrames(sid,ctr){
   let box=ctr.parentElement.querySelector(".frames");
   if(box){box.remove();return;}
-  box=el("div","frames");box.textContent="probing screenpipe…";
+  box=el("div","frames");
   ctr.parentElement.appendChild(box);
-  const r=await fetch("/api/frames?date="+DATE+"&session="+sid);const j=await r.json();
+  // skeleton strip while we resolve real frames
+  const skel=el("div","fstrip");
+  for(let i=0;i<5;i++)skel.appendChild(el("div","fskel"));
+  box.appendChild(skel);
+  let j;
+  try{
+    const r=await fetch("/api/frames?date="+DATE+"&session="+encodeURIComponent(sid));j=await r.json();
+  }catch(e){box.innerHTML="";box.appendChild(el("div","note","could not load frames: "+e));return;}
   box.innerHTML="";
-  if(j.frames_available){box.appendChild(el("div","note","screenpipe exposes frame images — "+j.frame_route));}
-  else{box.appendChild(el("div","note",j.note||"no frame images available"));}
+  const frames=j.frames||[];
+  if(frames.length){
+    const strip=el("div","fstrip");
+    frames.forEach((f,i)=>{
+      const cell=el("div","fthumb");
+      const img=el("img");img.loading="lazy";img.src="/frame/"+f.frame_id+".jpg";
+      img.alt="frame "+f.frame_id+" @"+(f.ts||"");
+      img.onerror=()=>{cell.classList.add("ferr");cell.textContent="✕";cell.title="frame unavailable";};
+      cell.appendChild(img);cell.appendChild(el("span","fcap",f.ts||""));
+      cell.onclick=(e)=>{e.stopPropagation();openLightbox(frames,i);};
+      strip.appendChild(cell);
+    });
+    box.appendChild(strip);
+  }
+  if(j.note)box.appendChild(el("div","note",j.note));
+  // OCR text timeline stays BELOW as the text evidence
+  const otl=el("div","ftimeline");
   (j.ocr_timeline||[]).forEach(f=>{
-    const line=el("div","frameline");line.innerHTML="<span class='t'>"+(f.time||"")+"</span>"+
-      "<b>"+(f.app||"")+"</b> "+(f.text||"");box.appendChild(line);
+    const line=el("div","frameline");const t=el("span","t",(f.time||"")+" ");
+    const app=el("b",null,f.app||"");line.appendChild(t);line.appendChild(app);
+    line.appendChild(document.createTextNode(" "+(f.text||"")));otl.appendChild(line);
   });
+  box.appendChild(otl);
+}
+let LB=null;
+function openLightbox(frames,idx){
+  closeLightbox();
+  const ov=el("div","lightbox");ov.id="lightbox";
+  const img=el("img","lbimg");
+  const cap=el("div","lbcap");
+  const prev=el("button","lbnav lbprev","‹");
+  const next=el("button","lbnav lbnext","›");
+  const close=el("button","lbclose","✕");
+  LB={frames:frames,idx:idx,img:img,cap:cap};
+  prev.onclick=(e)=>{e.stopPropagation();lbStep(-1);};
+  next.onclick=(e)=>{e.stopPropagation();lbStep(1);};
+  close.onclick=(e)=>{e.stopPropagation();closeLightbox();};
+  ov.onclick=()=>closeLightbox();
+  img.onclick=(e)=>e.stopPropagation();
+  ov.appendChild(close);ov.appendChild(prev);ov.appendChild(img);ov.appendChild(next);ov.appendChild(cap);
+  document.body.appendChild(ov);
+  document.addEventListener("keydown",lbKey);
+  lbShow();
+}
+function lbShow(){
+  if(!LB)return;const f=LB.frames[LB.idx];
+  LB.img.src="/frame/"+f.frame_id+".jpg?full=1";
+  LB.cap.textContent="frame "+f.frame_id+" · "+(f.ts||"")+"   ("+(LB.idx+1)+"/"+LB.frames.length+")  — raw, local-only";
+}
+function lbStep(d){if(!LB)return;LB.idx=(LB.idx+d+LB.frames.length)%LB.frames.length;lbShow();}
+function lbKey(e){
+  if(!LB)return;
+  if(e.key==="Escape")closeLightbox();
+  else if(e.key==="ArrowLeft")lbStep(-1);
+  else if(e.key==="ArrowRight")lbStep(1);
+}
+function closeLightbox(){
+  const ov=document.getElementById("lightbox");if(ov)ov.remove();
+  document.removeEventListener("keydown",lbKey);LB=null;
 }
 async function doLabel(sid,verdict){
   const flash=document.getElementById("flash-"+sid);

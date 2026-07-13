@@ -408,11 +408,22 @@ human debugging surface, not a machine API, but its JSON endpoints are stable:
   (verdict/source/confidence/needs_review) and `chain` (`label`, `rule`,
   `keyword.hits`, `llm`, `system_noise`), plus `goals[]`, `projects[]`,
   `archived_label_warnings[]`, `intentions`, `label_counts`, `resolution_counts`.
-- `GET /api/frames?session=ID` — frame references for a session's span. Probes
-  the running screenpipe for a live image route and proxies it via `/frame/<id>`
-  when present; otherwise returns the redacted OCR text timeline with an honest
-  note (screenpipe 0.4.25 keeps frames inside rolling `.mp4` chunks, not as
-  per-frame images — the page never fabricates one).
+- `GET /api/frames?session=ID` — up to 8 evenly-spaced **real** frame thumbnails
+  for a session's span. Reads screenpipe's own sqlite (`~/.screenpipe/db.sqlite`,
+  opened read-only) to find `frames` rows inside the session's UTC span, keeps
+  only those whose backing file still exists (rolling retention), and returns
+  `frames: [{frame_id, ts}]` with `frames_available`. The redacted OCR text
+  timeline is always included below as text evidence and is the honest fallback
+  when no frame resolves (db missing / retention gap) — the page never fabricates
+  an image.
+- `GET /frame/<id>.jpg[?full=1]` — extracts that exact frame as JPEG with ffmpeg:
+  a chunk-backed frame via `select=eq(n,offset_index)` (offset_index is the
+  frame's index within its `.mp4` chunk), or an event-driven `snapshot_path` jpg
+  directly. Thumbnails are scaled to ≤960px; `full=1` gives original size.
+  Extractions cache to `data/frame_cache` (gitignored, ~500MB LRU); served with
+  `Cache-Control: private, max-age=3600`. 404 (tiny JSON) when the frame is
+  unknown or its chunk has rolled out of retention. Frames are raw, unredacted
+  screen pixels — served on 127.0.0.1 only.
 - `POST /api/label {date, session_id, verdict}` — records a correction via the
   exact `scoregoals label` path (append label → re-mine rules → rescore) and
   returns the fresh day payload. Localhost-only; non-loopback clients are
